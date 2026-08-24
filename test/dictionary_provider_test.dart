@@ -38,11 +38,21 @@ class _FakeDictionaryServer {
     required this.myClerkId,
   });
 
+  /// This install's device id — matches `_NoStorageCrypto.ensureDeviceId`.
+  final String myDeviceId = 'device-test';
+
   final DictionaryCrypto crypto;
   List<int> chatKey;
   final String myPub;
   final String myUserId;
   final String myClerkId;
+
+  /// A second registered device of mine (per-device registry): its key
+  /// version can churn independently of [participantKeyVersion].
+  final String otherDeviceId = 'device-other';
+  bool includeOtherDevice = false;
+  int otherParticipantKeyVersion = 1;
+  int otherWrapDeviceKeyVersion = 1;
 
   int version = 2;
   List<DictEntry> entries = [
@@ -54,7 +64,7 @@ class _FakeDictionaryServer {
   int participantKeyVersion = 1;
 
   /// `deviceKeyVersion` baked into my wrap — lower than
-  /// [participantKeyVersion] simulates another device re-registering.
+  /// [participantKeyVersion] simulates this device re-registering.
   int wrapDeviceKeyVersion = 1;
 
   int putCalls = 0;
@@ -69,10 +79,22 @@ class _FakeDictionaryServer {
     if (intercepted != null) return intercepted;
     final path = req.url.path;
     if (req.method == 'GET' && path == '/api/user/public-key') {
-      return _json({'encPublicKey': myPub, 'version': participantKeyVersion});
+      return _json({
+        'encPublicKey': myPub,
+        'version': participantKeyVersion,
+        'devices': [
+          if (participantKeyVersion > 0)
+            {
+              'deviceId': myDeviceId,
+              'encPublicKey': myPub,
+              'version': participantKeyVersion,
+            },
+        ],
+      });
     }
     if (req.method == 'POST' && path == '/api/user/public-key') {
-      return _json({'version': 1});
+      final body = jsonDecode(req.body) as Map<String, dynamic>;
+      return _json({'version': 1, 'deviceId': body['deviceId']});
     }
     if (req.method == 'GET' && path == '/api/chats/c1/dictionary') {
       return _json(await _contextJson());
@@ -125,28 +147,51 @@ class _FakeDictionaryServer {
 
   Future<Map<String, dynamic>> _contextJson() async {
     final blob = await crypto.encryptEntries(entries: entries, chatKey: chatKey);
-    final wrap = await crypto.wrapChatKey(
+    final myWrap = await crypto.wrapChatKey(
       chatKey: chatKey,
       memberUserId: myUserId,
+      deviceId: myDeviceId,
       deviceKeyVersion: wrapDeviceKeyVersion,
       memberPubBase64: myPub,
     );
+    final otherWrap = includeOtherDevice
+        ? await crypto.wrapChatKey(
+            chatKey: chatKey,
+            memberUserId: myUserId,
+            deviceId: otherDeviceId,
+            deviceKeyVersion: otherWrapDeviceKeyVersion,
+            memberPubBase64: myPub,
+          )
+        : null;
     return {
       'dictionary': {
         'ciphertext': blob.ciphertext,
         'iv': blob.iv,
         'authTag': blob.authTag,
         'version': version,
-        'wraps': [wrap.toJson()],
+        'wraps': [
+          myWrap.toJson(),
+          if (otherWrap != null) otherWrap.toJson(),
+        ],
       },
       'participants': [
         {
           'userId': myUserId,
           'clerkId': myClerkId,
           'username': 'me',
+          'deviceId': myDeviceId,
           'encPublicKey': myPub,
           'encPublicKeyVersion': participantKeyVersion,
         },
+        if (includeOtherDevice)
+          {
+            'userId': myUserId,
+            'clerkId': myClerkId,
+            'username': 'me',
+            'deviceId': otherDeviceId,
+            'encPublicKey': myPub,
+            'encPublicKeyVersion': otherParticipantKeyVersion,
+          },
       ],
     };
   }
@@ -158,11 +203,16 @@ class _FakeDictionaryServer {
 class _NoStorageCrypto extends DictionaryCrypto {
   _NoStorageCrypto(this.pair);
 
+  static const testDeviceId = 'device-test';
+
   final SimpleKeyPair pair;
   final Map<String, String> keyCache = {};
 
   @override
   Future<SimpleKeyPair> ensureKeyPair() async => pair;
+
+  @override
+  Future<String> ensureDeviceId() async => testDeviceId;
 
   @override
   Future<void> cacheChatKey(String chatId, List<int> chatKey) async {
@@ -303,6 +353,7 @@ void main() {
                 'userId': 'user_me',
                 'clerkId': 'user_me',
                 'username': 'me',
+                'deviceId': 'device-test',
                 'encPublicKey': key.$2,
                 'encPublicKeyVersion': 1,
               },
@@ -339,7 +390,27 @@ void main() {
       expect(controller.state.needsRekey, isFalse);
       expect(controller.state.version, 3);
       expect(controller.state.entries.map((e) => e.code), ['a', 'm']);
-      expect(controller.state.wraps['user_me']!.deviceKeyVersion, 2);
+      expect(controller.state.wraps['user_me:device-test']!.deviceKeyVersion, 2);
+    });
+
+    test('another device re-registering does not stale my wrap', () async {
+      final key = await _keyMaterial();
+      final (container, fake) = await _make(key, null);
+      final controller = await _loadedController(container);
+      expect(controller.state.needsRekey, isFalse);
+
+      // My other device ('device-other') re-registered its key — that slot's
+      // version bumps and its own wrap goes stale, but THIS device must be
+      // unaffected (this is exactly what the single-key model got wrong).
+      fake
+        ..includeOtherDevice = true
+        ..otherParticipantKeyVersion = 2;
+      await controller.reload();
+
+      expect(fake.putCalls, 0, reason: 'no re-key should be needed');
+      expect(controller.state.needsRekey, isFalse);
+      expect(controller.state.version, 2, reason: 'dictionary unchanged');
+      expect(controller.state.entries.map((e) => e.code), ['a', 'm']);
     });
 
     test('without a cached key it falls back to needsRekey', () async {

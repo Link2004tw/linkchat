@@ -215,6 +215,12 @@ class _MemberWrapStatus extends StatelessWidget {
     final theme = Theme.of(context);
     if (participants.isEmpty) return const SizedBox.shrink();
 
+    // Group device entries by member so each person shows as one row.
+    final byUser = <String, List<DictionaryMember>>{};
+    for (final p in participants) {
+      byUser.putIfAbsent(p.userId, () => []).add(p);
+    }
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Column(
@@ -226,7 +232,7 @@ class _MemberWrapStatus extends StatelessWidget {
                 ?.copyWith(color: theme.colorScheme.outline),
           ),
           const SizedBox(height: 4),
-          for (final member in participants)
+          for (final entry in byUser.entries)
             Padding(
               padding: const EdgeInsets.only(bottom: 4),
               child: Row(
@@ -235,19 +241,21 @@ class _MemberWrapStatus extends StatelessWidget {
                     radius: 12,
                     backgroundColor: theme.colorScheme.primaryContainer,
                     child: Text(
-                      member.username.isNotEmpty ? member.username[0] : '?',
+                      entry.value.first.username.isNotEmpty
+                          ? entry.value.first.username[0]
+                          : '?',
                       style: theme.textTheme.labelSmall,
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      member.username,
+                      entry.value.first.username,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodySmall,
                     ),
                   ),
-                  _wrapBadge(context, member),
+                  _wrapBadge(context, entry.value),
                 ],
               ),
             ),
@@ -256,10 +264,23 @@ class _MemberWrapStatus extends StatelessWidget {
     );
   }
 
-  Widget _wrapBadge(BuildContext context, DictionaryMember member) {
+  /// Wrapped when every registered device of this member has a current wrap.
+  Widget _wrapBadge(BuildContext context, List<DictionaryMember> devices) {
     final theme = Theme.of(context);
-    final wrapped = _wrapped(member);
-    if (wrapped) {
+    final keyed = devices.where((d) => d.hasPublicKey).toList();
+    if (keyed.isEmpty) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.help_outline, size: 16, color: theme.colorScheme.outline),
+          const SizedBox(width: 4),
+          Text('no key yet', style: theme.textTheme.labelSmall),
+        ],
+      );
+    }
+    final current =
+        keyed.where((d) => _wrapped(d)).length;
+    if (current == keyed.length) {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -269,19 +290,23 @@ class _MemberWrapStatus extends StatelessWidget {
         ],
       );
     }
+    final partial = keyed.length > 1;
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Icon(Icons.error_outline, size: 16, color: theme.colorScheme.error),
         const SizedBox(width: 4),
-        Text('needs re-key', style: theme.textTheme.labelSmall),
+        Text(
+          partial ? '$current/${keyed.length} devices' : 'needs re-key',
+          style: theme.textTheme.labelSmall,
+        ),
       ],
     );
   }
 
   bool _wrapped(DictionaryMember member) {
     if (!member.hasPublicKey) return false;
-    final wrap = wraps[member.userId];
+    final wrap = wraps[member.key];
     if (wrap == null) return false;
     return wrap.deviceKeyVersion == member.encPublicKeyVersion;
   }

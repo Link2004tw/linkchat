@@ -107,21 +107,23 @@ class DictionaryController
       final myClerkId = me?.clerkId;
       if (myClerkId == null) return;
 
-      // Ensure this device's public key is registered so peers can wrap
-      // the chat key for us.
+      // Ensure this device's keypair + stable id are registered so peers
+      // can wrap the chat key for this device specifically.
       final myKey = await crypto.ensureKeyPair();
       final myPub = base64Encode(
         (await myKey.extractPublicKey()).bytes,
       );
-      final registered = await repo.getMyPublicKey();
-      if (registered.encPublicKey != myPub) {
-        await repo.registerPublicKey(myPub);
+      final deviceId = await crypto.ensureDeviceId();
+      final myDevices = await repo.getMyDevices();
+      final mine = myDevices.where((d) => d.deviceId == deviceId).toList();
+      if (mine.isEmpty || mine.first.encPublicKey != myPub) {
+        await repo.registerPublicKey(myPub, deviceId);
       }
 
       final context = await repo.getDictionary(chatId);
 
-      // Find my member record by Clerk id.
-      final myMember = context.memberByClerkId(myClerkId);
+      // Find my device's entry (participants are per member-device).
+      final myMember = context.memberFor(myClerkId, deviceId);
 
       if (!context.exists || myMember == null) {
         // Lazy init: no dictionary yet — nothing to decrypt.
@@ -138,7 +140,7 @@ class DictionaryController
         return;
       }
 
-      final myWrap = context.wraps[myMember.userId];
+      final myWrap = context.wraps[myMember.key];
       if (myWrap == null ||
           myWrap.deviceKeyVersion != myMember.encPublicKeyVersion) {
         // My wrap is missing/stale — try self-healing from the cached key
@@ -290,6 +292,7 @@ class DictionaryController
       wraps.add(await crypto.wrapChatKey(
         chatKey: _chatKey!,
         memberUserId: member.userId,
+        deviceId: member.deviceId,
         deviceKeyVersion: member.encPublicKeyVersion,
         memberPubBase64: member.encPublicKey,
       ));
@@ -304,7 +307,7 @@ class DictionaryController
     );
     return (
       version: savedVersion,
-      wraps: {for (final w in wraps) w.userId: w},
+      wraps: {for (final w in wraps) w.key: w},
     );
   }
 

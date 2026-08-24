@@ -226,6 +226,7 @@ void main() {
       final wrap = await crypto.wrapChatKey(
         chatKey: chatKey,
         memberUserId: 'user-1',
+        deviceId: 'device-a',
         deviceKeyVersion: 3,
         memberPubBase64: memberPubB64,
       );

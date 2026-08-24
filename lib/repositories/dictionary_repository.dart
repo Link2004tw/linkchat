@@ -44,22 +44,49 @@ class DictionaryRepository {
     return (map['version'] as num?)?.toInt() ?? version;
   }
 
-  /// Registers this device's public key (bumps the user's key version).
-  Future<int> registerPublicKey(String encPublicKey) async {
+  /// Registers this device's public key under [deviceId] (bumps that
+  /// device's key version; other devices are unaffected).
+  Future<int> registerPublicKey(String encPublicKey, String deviceId) async {
     final data = await _api.post('/user/public-key', body: {
       'encPublicKey': encPublicKey,
+      'deviceId': deviceId,
     });
     final map = data is Map<String, dynamic> ? data : const {};
     return (map['version'] as num?)?.toInt() ?? 0;
   }
 
-  /// Reads the caller's registered public key + version.
-  Future<({String encPublicKey, int version})> getMyPublicKey() async {
+  /// Reads the caller's registered devices (deviceId + public key + version).
+  Future<List<DictionaryMember>> getMyDevices() async {
     final data = await _api.get('/user/public-key');
     final map = data is Map<String, dynamic> ? data : const {};
-    return (
-      encPublicKey: map['encPublicKey'] as String? ?? '',
-      version: (map['version'] as num?)?.toInt() ?? 0,
-    );
+    final raw = map['devices'];
+    if (raw is! List) {
+      // Legacy backend shape: a single flat key.
+      final pub = map['encPublicKey'] as String? ?? '';
+      final version = (map['version'] as num?)?.toInt() ?? 0;
+      if (pub.isEmpty) return const [];
+      return [
+        DictionaryMember(
+          userId: '',
+          clerkId: '',
+          username: '',
+          deviceId: 'default',
+          encPublicKey: pub,
+          encPublicKeyVersion: version,
+        ),
+      ];
+    }
+    return [
+      for (final d in raw)
+        if (d is Map<String, dynamic>)
+          DictionaryMember(
+            userId: '',
+            clerkId: '',
+            username: '',
+            deviceId: d['deviceId'] as String? ?? 'default',
+            encPublicKey: d['encPublicKey'] as String? ?? '',
+            encPublicKeyVersion: (d['version'] as num?)?.toInt() ?? 0,
+          ),
+    ];
   }
 }

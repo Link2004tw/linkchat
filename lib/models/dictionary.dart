@@ -47,7 +47,7 @@ class DictionaryContext {
   final String? authTag;
   final int version;
 
-  /// userId → wrap (opaque, for unwrapping the chat key).
+  /// wrap-key (`userId:deviceId`) → wrap, for staleness checks in the UI.
   final Map<String, DictionaryWrap> wraps;
 
   /// Chat participants with their public keys (for wrapping).
@@ -77,25 +77,29 @@ class DictionaryContext {
       iv: asString(dictionaryMap?['iv']),
       authTag: asString(dictionaryMap?['authTag']),
       version: asInt(dictionaryMap?['version']) ?? 0,
-      wraps: {for (final w in rawWraps) w.userId: w},
+      wraps: {for (final w in rawWraps) w.key: w},
       participants: participants,
     );
   }
 
-  DictionaryMember? memberByClerkId(String clerkId) {
+  /// The participant entry matching this user's [deviceId] (entries are
+  /// per device — a member appears once per registered device).
+  DictionaryMember? memberFor(String clerkId, String deviceId) {
     for (final p in participants) {
-      if (p.clerkId == clerkId) return p;
+      if (p.clerkId == clerkId && p.deviceId == deviceId) return p;
     }
     return null;
   }
 }
 
-/// A chat participant as returned with the dictionary context.
+/// A chat participant device as returned with the dictionary context —
+/// one entry per registered member device.
 class DictionaryMember {
   const DictionaryMember({
     required this.userId,
     required this.clerkId,
     required this.username,
+    required this.deviceId,
     required this.encPublicKey,
     required this.encPublicKeyVersion,
   });
@@ -104,26 +108,34 @@ class DictionaryMember {
   final String clerkId;
   final String username;
 
+  /// Registered device slot ("default" = legacy single user-level key).
+  final String deviceId;
+
   /// Base64 X25519 public key, or empty if the member never registered.
   final String encPublicKey;
   final int encPublicKeyVersion;
 
   bool get hasPublicKey => encPublicKey.isNotEmpty;
 
+  /// Map key identifying this device entry (userId + device slot).
+  String get key => '$userId:$deviceId';
+
   factory DictionaryMember.fromJson(Map<String, dynamic> json) =>
       DictionaryMember(
         userId: asString(json['userId']) ?? '',
         clerkId: asString(json['clerkId']) ?? '',
         username: asString(json['username']) ?? '',
+        deviceId: asString(json['deviceId']) ?? 'default',
         encPublicKey: asString(json['encPublicKey']) ?? '',
         encPublicKeyVersion: asInt(json['encPublicKeyVersion']) ?? 0,
       );
 }
 
-/// A wrapped copy of the shared chat key for one member.
+/// A wrapped copy of the shared chat key for one member device.
 class DictionaryWrap {
   const DictionaryWrap({
     required this.userId,
+    this.deviceId = 'default',
     required this.deviceKeyVersion,
     required this.encKey,
     required this.iv,
@@ -132,6 +144,9 @@ class DictionaryWrap {
   });
 
   final String userId;
+
+  /// Registered device slot ("default" = legacy single user-level key).
+  final String deviceId;
   final int deviceKeyVersion;
   final String encKey;
   final String iv;
@@ -142,6 +157,7 @@ class DictionaryWrap {
 
   factory DictionaryWrap.fromJson(Map<String, dynamic> json) => DictionaryWrap(
         userId: asString(json['userId']) ?? '',
+        deviceId: asString(json['deviceId']) ?? 'default',
         deviceKeyVersion: asInt(json['deviceKeyVersion']) ?? 0,
         encKey: asString(json['encKey']) ?? '',
         iv: asString(json['iv']) ?? '',
@@ -149,8 +165,12 @@ class DictionaryWrap {
         wrapPub: asString(json['wrapPub']) ?? '',
       );
 
+  /// Map key identifying the targeted device (userId + device slot).
+  String get key => '$userId:$deviceId';
+
   Map<String, dynamic> toJson() => {
         'userId': userId,
+        'deviceId': deviceId,
         'deviceKeyVersion': deviceKeyVersion,
         'encKey': encKey,
         'iv': iv,

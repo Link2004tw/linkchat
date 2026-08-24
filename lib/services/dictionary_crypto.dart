@@ -17,7 +17,28 @@ class DictionaryCrypto {
       : _storage = storage ?? const FlutterSecureStorage();
 
   static const String _seedKey = 'dict_x25519_seed';
+  static const String _deviceIdKey = 'dict_device_id';
   static const String _chatKeyPrefix = 'dict_chatkey_';
+
+  String? _cachedDeviceId;
+
+  /// This install's stable identifier for the per-device key registry.
+  /// Generated once and persisted; registering a new device never stales
+  /// another device's wraps because each has its own key slot server-side.
+  Future<String> ensureDeviceId() async {
+    final cached = _cachedDeviceId;
+    if (cached != null) return cached;
+    final existing = await _storage.read(key: _deviceIdKey);
+    if (existing != null && existing.isNotEmpty) {
+      return _cachedDeviceId = existing;
+    }
+    final rng = Random.secure();
+    final id = base64UrlEncode(
+      Uint8List.fromList(List.generate(16, (_) => rng.nextInt(256))),
+    ).replaceAll('=', '');
+    await _storage.write(key: _deviceIdKey, value: id);
+    return _cachedDeviceId = id;
+  }
 
   final FlutterSecureStorage _storage;
 
@@ -89,11 +110,14 @@ class DictionaryCrypto {
     await _storage.delete(key: '$_chatKeyPrefix$chatId');
   }
 
-  /// Wraps [chatKey] for the member whose public key is [memberPubBase64].
-  /// Uses an ephemeral X25519 pair so only the recipient can unwrap.
+  /// Wraps [chatKey] for the member device whose public key is
+  /// [memberPubBase64]. Uses an ephemeral X25519 pair so only the recipient
+  /// can unwrap. The AAD stays user-scoped so pre-registry wraps remain
+  /// decryptable during the migration.
   Future<DictionaryWrap> wrapChatKey({
     required List<int> chatKey,
     required String memberUserId,
+    required String deviceId,
     required int deviceKeyVersion,
     required String memberPubBase64,
   }) async {
@@ -113,6 +137,7 @@ class DictionaryCrypto {
     );
     return DictionaryWrap(
       userId: memberUserId,
+      deviceId: deviceId,
       deviceKeyVersion: deviceKeyVersion,
       encKey: base64Encode(box.cipherText),
       iv: base64Encode(box.nonce),
