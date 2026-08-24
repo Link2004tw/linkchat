@@ -48,6 +48,36 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
     );
   }
 
+  Future<void> _resetDictionary() async {
+    final confirmed = await confirmDialog(
+      context,
+      title: 'Start over?',
+      message: 'The old dictionary can no longer be decrypted by any '
+          'device. Starting over creates a new key and saves the current '
+          'list (${_entries.where((e) => e.isValid).length} code words) for '
+          'everyone.',
+      confirmLabel: 'Start over',
+      destructive: true,
+    );
+    if (!mounted || !confirmed) return;
+    setState(() => _saving = true);
+    final result =
+        await ref.read(dictionaryProvider(widget.chat.id).notifier).reset(
+              [for (final e in _entries) if (e.isValid) e],
+            );
+    if (!mounted) return;
+    setState(() {
+      _saving = false;
+      if (result.ok && result.entries != null) {
+        _entries = result.entries!;
+      }
+    });
+    showSnack(
+      context,
+      result.ok ? 'Dictionary re-keyed' : result.error ?? 'Error',
+    );
+  }
+
   Future<void> _editEntry({int? index}) async {
     final isNew = index == null;
     final current = isNew ? const DictEntry(code: '', meaning: '') : _entries[index];
@@ -118,16 +148,53 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
       ),
       body: Column(
         children: [
+          if (dict.error != null && !dict.isLoading)
+            Container(
+              width: double.infinity,
+              color: theme.colorScheme.errorContainer,
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      dict.error!,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onErrorContainer,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.tonal(
+                    onPressed: () => ref
+                        .read(dictionaryProvider(widget.chat.id).notifier)
+                        .reload(),
+                    child: const Text('Retry'),
+                  ),
+                ],
+              ),
+            ),
           if (dict.needsRekey)
             Container(
               width: double.infinity,
               color: theme.colorScheme.errorContainer,
               padding: const EdgeInsets.all(12),
-              child: Text(
-                'Your device can’t read this dictionary yet — ask a member '
-                'to open and save it so your key gets wrapped.',
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.colorScheme.onErrorContainer),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Your device can’t read this dictionary anymore — the key '
+                    'that encrypted it is lost. You can start over with a new '
+                    'key (old code words can’t be recovered).',
+                    style: theme.textTheme.bodySmall
+                        ?.copyWith(color: theme.colorScheme.onErrorContainer),
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton.tonalIcon(
+                    onPressed: _saving ? null : _resetDictionary,
+                    icon: const Icon(Icons.restart_alt),
+                    label: const Text('Start over'),
+                  ),
+                ],
               ),
             ),
           if (dict.isLoading && !dict.hasDictionary)

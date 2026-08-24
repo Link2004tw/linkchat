@@ -51,6 +51,15 @@ class _FakeDictionaryServer {
   /// version can churn independently of [participantKeyVersion].
   final String otherDeviceId = 'device-other';
   bool includeOtherDevice = false;
+
+  /// When true, my wrap is stored in pre-registry shape (no deviceId) —
+  /// the migration scenario for chats saved before per-device keys.
+  bool legacyWrapOnly = false;
+
+  /// When set, the stored blob is encrypted under this key instead of
+  /// [chatKey] — the wrap still unwraps, but decrypting fails (simulates a
+  /// dictionary re-keyed elsewhere during a partial recovery).
+  List<int>? corruptWithKey;
   int otherParticipantKeyVersion = 1;
   int otherWrapDeviceKeyVersion = 1;
 
@@ -134,19 +143,27 @@ class _FakeDictionaryServer {
         );
       }
       version = payloadVersion;
-      entries = await crypto.decryptEntries(
-        ciphertext: dict['ciphertext'] as String,
-        iv: dict['iv'] as String,
-        authTag: dict['authTag'] as String,
-        chatKey: chatKey,
-      );
+      try {
+        entries = await crypto.decryptEntries(
+          ciphertext: dict['ciphertext'] as String,
+          iv: dict['iv'] as String,
+          authTag: dict['authTag'] as String,
+          chatKey: chatKey,
+        );
+      } on Exception {
+        // The client rotated the chat key (dictionary reset) — the blob is
+        // opaque to the server anyway.
+      }
       return _json({'version': payloadVersion});
     }
     return _json({'error': 'not found'}, 404);
   }
 
   Future<Map<String, dynamic>> _contextJson() async {
-    final blob = await crypto.encryptEntries(entries: entries, chatKey: chatKey);
+    final blob = await crypto.encryptEntries(
+      entries: entries,
+      chatKey: corruptWithKey ?? chatKey,
+    );
     final myWrap = await crypto.wrapChatKey(
       chatKey: chatKey,
       memberUserId: myUserId,
@@ -163,6 +180,8 @@ class _FakeDictionaryServer {
             memberPubBase64: myPub,
           )
         : null;
+    final myJson = myWrap.toJson();
+    if (legacyWrapOnly) myJson.remove('deviceId');
     return {
       'dictionary': {
         'ciphertext': blob.ciphertext,
@@ -170,7 +189,7 @@ class _FakeDictionaryServer {
         'authTag': blob.authTag,
         'version': version,
         'wraps': [
-          myWrap.toJson(),
+          myJson,
           if (otherWrap != null) otherWrap.toJson(),
         ],
       },
@@ -393,6 +412,23 @@ void main() {
       expect(controller.state.wraps['user_me:device-test']!.deviceKeyVersion, 2);
     });
 
+    test('a pre-registry legacy wrap still unwraps after the upgrade',
+        () async {
+      final key = await _keyMaterial();
+      final (container, fake) = await _make(key, null);
+      final controller = await _loadedController(container);
+
+      // Post-upgrade world: my participant entry is per-device, but the
+      // only stored wrap predates the registry (no deviceId) and was made
+      // against this device's key (versions match).
+      fake.legacyWrapOnly = true;
+      await controller.reload();
+
+      expect(fake.putCalls, 0, reason: 'no re-key needed for own legacy wrap');
+      expect(controller.state.needsRekey, isFalse);
+      expect(controller.state.entries.map((e) => e.code), ['a', 'm']);
+    });
+
     test('another device re-registering does not stale my wrap', () async {
       final key = await _keyMaterial();
       final (container, fake) = await _make(key, null);
@@ -451,6 +487,145 @@ void main() {
             .containsKey('c1'),
         isFalse,
       );
+    });
+    test('reset re-keys a dead dictionary with a fresh chat key', () async {
+      final key = await _keyMaterial();
+      final (container, fake) = await _make(key, null);
+      final controller = await _loadedController(container);
+
+      // Nobody can decrypt the stored blob anymore: the wrap went stale
+      // AND the self-heal cache is empty (never opened on this install).
+      fake
+        ..participantKeyVersion = 2
+        ..failFirstPut = false;
+      (container.read(dictionaryCryptoProvider) as _NoStorageCrypto)
+          .keyCache
+          .clear();
+      await controller.reload();
+      expect(controller.state.needsRekey, isTrue);
+
+      final result =
+          await controller.reset([const DictEntry(code: 'n', meaning: 'New')]);
+
+      expect(result.ok, isTrue, reason: result.error);
+      expect(fake.putCalls, 1);
+      expect(fake.version, 3);
+      expect(controller.state.needsRekey, isFalse);
+      expect(controller.state.version, 3);
+      expect(result.entries!.map((e) => e.code), ['n']);
+      // The fresh wrap set covers my device at its current version.
+      expect(
+        controller.state.wraps['user_me:device-test']!.deviceKeyVersion,
+        2,
+      );
+    });
+
+    test('reset refuses when the dictionary is still readable', () async {
+      final key = await _keyMaterial();
+      final (container, fake) = await _make(key, null);
+      final controller = await _loadedController(container);
+
+      final result = await controller.reset(const []);
+      expect(result.ok, isFalse);
+      expect(result.error, contains('nothing to reset'));
+      expect(fake.putCalls, 0);
+    });
+
+    test('a coverage rejection (422) surfaces the raw message', () async {
+      final key = await _keyMaterial();
+      final server = _FakeDictionaryServer(
+        crypto: DictionaryCrypto(),
+        chatKey: key.$1,
+        myPub: key.$2,
+        myUserId: 'user_me',
+        myClerkId: 'user_me',
+      );
+      final (container, _) = await _make(key, server);
+      final controller = await _loadedController(container);
+
+      server.beforeRequest = (req) {
+        if (req.method == 'PUT' && req.url.path == '/api/chats/c1/dictionary') {
+          return _json(
+            {'error': 'dictionary.wraps must cover user_x/dev_y at their current device-key version'},
+            422,
+          );
+        }
+        return null;
+      };
+
+      final result =
+          await controller.save([const DictEntry(code: 'm', meaning: 'Markus')]);
+      expect(result.ok, isFalse);
+      expect(result.error, contains('must cover user_x/dev_y'));
+    });
+    test('a failing decrypt leaves a visible error and save() refuses',
+        () async {
+      final key = await _keyMaterial();
+      final (container, fake) = await _make(key, null);
+      // Keep one provider instance alive for the whole test — without a
+      // listener the autoDispose provider is recreated between statements
+      // and loses the failed-load state.
+      final sub = container.listen(dictionaryProvider('c1'), (_, _) {});
+      addTearDown(sub.close);
+      var controller = await _loadedController(container);
+
+      // Corrupt round: the blob is encrypted under the wrong key while the
+      // wrap itself stays valid — unwrap succeeds, decrypt fails, just like
+      // a chat re-keyed elsewhere during a partial recovery.
+      final wrongKey = Uint8List.fromList(await DictionaryCrypto().createChatKey());
+      fake.corruptWithKey = wrongKey;
+
+      // Force a truly dead dictionary: blob undecryptable AND no cached
+      // chat key anywhere on this install.
+      await container.read(chatCacheProvider).clear();
+      (container.read(dictionaryCryptoProvider) as _NoStorageCrypto)
+          .keyCache
+          .clear();
+      fake.failFirstPut = false;
+      container.invalidate(dictionaryProvider('c1'));
+      controller = container.read(dictionaryProvider('c1').notifier);
+      await controller.reload();
+
+      expect(controller.state.error, isNotNull);
+      expect(controller.state.isLoading, isFalse);
+      // Unreadable state, not a zombie: version/participants are kept so
+      // Start over can save a fresh dictionary for everyone.
+      expect(controller.state.needsRekey, isTrue);
+      expect(controller.state.hasDictionary, isTrue);
+      expect(controller.state.version, 2);
+      expect(controller.state.participants, hasLength(1));
+
+      // A plain save can't invent a chat key from nothing.
+      final result =
+          await controller.save([const DictEntry(code: 'm', meaning: 'Markus')]);
+      expect(result.ok, isFalse);
+      expect(result.error, contains('no chat key'));
+      expect(fake.putCalls, 0);
+
+      // Start over is the recovery path: fresh chat key, everyone wrapped.
+      final reset =
+          await controller.reset([const DictEntry(code: 'n', meaning: 'New')]);
+      expect(reset.ok, isTrue, reason: reset.error);
+      expect(fake.putCalls, 1);
+      expect(fake.version, 3);
+      expect(controller.state.needsRekey, isFalse);
+      expect(controller.state.version, 3);
+      // Wrap covers my device at its current key version (1 here).
+      expect(
+        controller.state.wraps['user_me:device-test']!.deviceKeyVersion,
+        1,
+      );
+
+      // Server heals (blob fixed) → Retry loads cleanly and saving works.
+      fake.corruptWithKey = null;
+      await controller.reload();
+      expect(controller.state.error, isNull);
+      expect(controller.state.entries.map((e) => e.code), ['a', 'm']);
+
+      final retry = await controller.save(
+        [const DictEntry(code: 'm', meaning: 'Markus')],
+      );
+      expect(retry.ok, isTrue, reason: retry.error);
     });
   });
 

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/api_client.dart';
@@ -140,7 +140,11 @@ class DictionaryController
         return;
       }
 
-      final myWrap = context.wraps[myMember.key];
+      // My per-device wrap first; fall back to the pre-registry legacy
+      // wrap ("default" slot) when it was made against this device's key
+      // — same seed → same public key → adopted version matches.
+      final myWrap = context.wraps[myMember.key] ??
+          _legacyWrapFor(context, myMember, deviceId);
       if (myWrap == null ||
           myWrap.deviceKeyVersion != myMember.encPublicKeyVersion) {
         // My wrap is missing/stale — try self-healing from the cached key
@@ -161,24 +165,53 @@ class DictionaryController
         return;
       }
 
-      final chatKey = await crypto.unwrapChatKey(
-        myKeyPair: myKey,
-        wrap: myWrap,
-      );
+      final usedLegacyWrap = !context.wraps.containsKey(myMember.key);
+      Uint8List chatKey;
+      List<DictEntry> entries;
+      try {
+        chatKey = await crypto.unwrapChatKey(
+          myKeyPair: myKey,
+          wrap: myWrap,
+        );
+        entries = await crypto.decryptEntries(
+          ciphertext: context.ciphertext!,
+          iv: context.iv!,
+          authTag: context.authTag!,
+          chatKey: chatKey,
+        );
+      } catch (e) {
+        debugPrint(
+          'dictionary[$chatId]: decrypt via '
+          '${usedLegacyWrap ? 'legacy' : 'per-device'} wrap FAILED: $e',
+        );
+        // We hold a valid server context but cannot decrypt with any wrap
+        // we have — the chat key is lost to this device (and per the
+        // coverage checks, everyone else's too). Surface the Start-over
+        // path instead of a dead zombie; version/participants/wraps are
+        // kept so reset() can re-key and save for everyone.
+        _chatKey = null;
+        state = DictionaryState(
+          isLoading: false,
+          entries: const [],
+          version: context.version,
+          participants: context.participants,
+          wraps: context.wraps,
+          needsRekey: true,
+          hasDictionary: true,
+          error: 'This dictionary can’t be decrypted anymore — start over.',
+        );
+        return;
+      }
+
       _chatKey = chatKey;
       // Remember the key so this device can self-heal if its wrap goes
-      // stale later (another device re-registering its public key).
+      // stale later (another device re-registering its public key). Only
+      // cached after it proved able to decrypt the blob.
       try {
         await crypto.cacheChatKey(chatId, chatKey);
       } catch (_) {
         // Secure storage unavailable — device just can't self-heal.
       }
-      final entries = await crypto.decryptEntries(
-        ciphertext: context.ciphertext!,
-        iv: context.iv!,
-        authTag: context.authTag!,
-        chatKey: chatKey,
-      );
 
       state = DictionaryState(
         isLoading: false,
@@ -189,12 +222,17 @@ class DictionaryController
         needsRekey: false,
         hasDictionary: true,
       );
+      debugPrint(
+        'dictionary[$chatId]: loaded hasDict=true v=${context.version} '
+        'participants=${context.participants.length}',
+      );
       try {
         await ref.read(chatCacheProvider).writeDictionary(chatId, entries);
       } on StateError {
         // Provider disposed mid-write — fine.
       }
     } catch (e) {
+      debugPrint('dictionary[$chatId]: LOAD FAILED: $e');
       state = state.copyWith(
         isLoading: false,
         error: 'Could not load dictionary ($e)',
@@ -203,6 +241,29 @@ class DictionaryController
   }
 
   Future<void> reload() => _load();
+
+  /// The pre-registry wrap (`userId:default`), but only when it was made
+  /// against this device's key — i.e. this device adopted the legacy slot
+  /// and its version matches. Returns null otherwise.
+  DictionaryWrap? _legacyWrapFor(
+    DictionaryContext context,
+    DictionaryMember me,
+    String deviceId,
+  ) {
+    final legacy = context.wraps['${me.userId}:default'];
+    if (legacy == null) return null;
+    if (legacy.deviceKeyVersion != me.encPublicKeyVersion) {
+      debugPrint(
+        'dictionary: legacy wrap for ${me.userId} is v${legacy.deviceKeyVersion}, '
+        'this device is v${me.encPublicKeyVersion} — not usable',
+      );
+      return null;
+    }
+    debugPrint(
+      'dictionary: using pre-registry legacy wrap for ${me.userId} on $deviceId',
+    );
+    return legacy;
+  }
 
   /// Attempts to recover from a missing/stale wrap using the chat key
   /// cached in secure storage from a previous successful open: decrypts
@@ -234,6 +295,7 @@ class DictionaryController
         );
       } catch (_) {
         // Wrong/stale cached key — drop it and fall back to manual re-key.
+        debugPrint('dictionary[$chatId]: cached chat key failed to decrypt — dropping it');
         try {
           await crypto.clearCachedChatKey(chatId);
         } catch (_) {}
@@ -248,6 +310,7 @@ class DictionaryController
           authTag: current.authTag!,
           version: current.version + 1,
         );
+        debugPrint('dictionary[$chatId]: self-heal re-keyed at v${saved.version}');
         state = DictionaryState(
           isLoading: false,
           entries: entries,
@@ -264,10 +327,14 @@ class DictionaryController
         }
         return true;
       } on ApiException catch (e) {
+        debugPrint(
+          'dictionary[$chatId]: self-heal save rejected (${e.statusCode}) ${e.message}',
+        );
         if (e.statusCode != 409) return false;
         // A concurrent save won — take the freshest blob and retry once.
         current = await repo.getDictionary(chatId);
-      } catch (_) {
+      } catch (e) {
+        debugPrint('dictionary[$chatId]: self-heal failed: $e');
         return false;
       }
     }
@@ -297,6 +364,10 @@ class DictionaryController
         memberPubBase64: member.encPublicKey,
       ));
     }
+    debugPrint(
+      'dictionary[$chatId]: wrapping ${participants.length} participants '
+      'with ${wraps.length} wraps at v$version',
+    );
     final savedVersion = await repo.saveDictionary(
       chatId: chatId,
       version: version,
@@ -305,10 +376,83 @@ class DictionaryController
       authTag: authTag,
       wraps: wraps,
     );
+    debugPrint(
+      'dictionary[$chatId]: wrapped ${participants.length} participants '
+      'with ${wraps.length} wraps at v$savedVersion',
+    );
     return (
       version: savedVersion,
       wraps: {for (final w in wraps) w.key: w},
     );
+  }
+
+  /// Re-keys a dead dictionary from scratch: fresh chat key, [entries]
+  /// encrypted under it, wraps for every current participant device. This
+  /// is the migration path for chats no device can decrypt anymore
+  /// (`needsRekey`): the old code words are gone, but the chat keeps
+  /// working with whatever the user re-enters. Returns the saved entries.
+  Future<({bool ok, String? error, List<DictEntry>? entries})> reset(
+    List<DictEntry> entries,
+  ) async {
+    try {
+      if (state.isLoading) {
+        return (ok: false, error: 'Dictionary still loading', entries: null);
+      }
+      if (!state.needsRekey) {
+        return (
+          ok: false,
+          error: 'Dictionary is still readable — nothing to reset',
+          entries: null,
+        );
+      }
+      debugPrint(
+        'dictionary[$chatId]: reset — creating a new chat key at v${state.version + 1}',
+      );
+      final crypto = ref.read(dictionaryCryptoProvider);
+      _chatKey = Uint8List.fromList(await crypto.createChatKey());
+      try {
+        await crypto.cacheChatKey(chatId, _chatKey!);
+      } catch (_) {}
+      final blob = await crypto.encryptEntries(
+        entries: entries,
+        chatKey: _chatKey!,
+      );
+      final saved = await _wrapAndSave(
+        participants: state.participants,
+        ciphertext: blob.ciphertext,
+        iv: blob.iv,
+        authTag: blob.authTag,
+        version: state.version + 1,
+      );
+      state = DictionaryState(
+        isLoading: false,
+        entries: entries,
+        version: saved.version,
+        participants: state.participants,
+        wraps: saved.wraps,
+        needsRekey: false,
+        hasDictionary: true,
+      );
+      debugPrint('dictionary[$chatId]: reset complete at v${saved.version}');
+      try {
+        await ref.read(chatCacheProvider).writeDictionary(chatId, entries);
+      } on StateError {
+        // Dispose race — ignore.
+      }
+      return (ok: true, error: null, entries: entries);
+    } on ApiException catch (e) {
+      debugPrint('dictionary[$chatId]: reset rejected (${e.statusCode}) ${e.message}');
+      return (
+        ok: false,
+        error: e.statusCode == 422
+            ? 'Member list changed — please try again'
+            : 'Could not reset dictionary: ${e.message}',
+        entries: null,
+      );
+    } catch (err) {
+      debugPrint('dictionary[$chatId]: reset failed: $err');
+      return (ok: false, error: 'Could not reset dictionary: $err', entries: null);
+    }
   }
 
   /// Saves [entries]: re-encrypts under the chat key (creating it on first
@@ -326,6 +470,19 @@ class DictionaryController
       try {
         if (state.isLoading) {
           return (ok: false, error: 'Dictionary still loading', entries: null);
+        }
+        if (!state.hasDictionary && state.error != null) {
+          // Zombie state: the last load failed (version 0, no participants)
+          // — any save from here would write a blob with zero wraps that
+          // can never pass coverage, even if an old chat key lingers.
+          debugPrint(
+            'dictionary[$chatId]: refusing to save from a failed-load state',
+          );
+          return (
+            ok: false,
+            error: 'Dictionary failed to load — close and reopen this screen',
+            entries: null,
+          );
         }
         if (!state.hasDictionary && _chatKey == null) {
           _chatKey = Uint8List.fromList(await ref
@@ -381,22 +538,30 @@ class DictionaryController
         }
         return (ok: true, error: null, entries: entries);
       } on ApiException catch (e) {
-        if (e.statusCode != 409) {
+        debugPrint('dictionary: save rejected (${e.statusCode}) ${e.message}');
+        // 409 = a concurrent save won (merge + retry). 422 = our wrap set
+        // didn't cover someone (stale participant view) — reload and retry
+        // once with fresh participants, but don't merge. Anything else is
+        // surfaced raw so real problems aren't masked by a generic message.
+        final retryable = e.statusCode == 409 || e.statusCode == 422;
+        if (!retryable) {
           return (
             ok: false,
-            error: 'Could not save dictionary: $e',
+            error: 'Could not save dictionary: ${e.message}',
             entries: null,
           );
         }
         if (attempt == 2) {
           return (
             ok: false,
-            error: 'Dictionary changed too many times — please try again',
+            error: e.statusCode == 409
+                ? 'Dictionary changed too many times — please try again'
+                : 'Could not save dictionary: ${e.message}',
             entries: null,
           );
         }
-        // A concurrent save won: reload the freshest version, merge this
-        // device's pending edits on top, and retry with the new version.
+        // A concurrent save won or our coverage went stale: reload the
+        // freshest version and retry with new participants/version.
         await _load();
         if (state.needsRekey) {
           return (
@@ -405,14 +570,17 @@ class DictionaryController
             entries: null,
           );
         }
-        entries = DictionaryCrypto.mergeDictionaryEntries(
-          remote: state.entries,
-          local: entries,
-        );
-      } catch (e) {
+        if (e.statusCode == 409) {
+          entries = DictionaryCrypto.mergeDictionaryEntries(
+            remote: state.entries,
+            local: entries,
+          );
+        }
+      } catch (err, st) {
+        debugPrint('dictionary: save failed: $err\n$st');
         return (
           ok: false,
-          error: 'Could not save dictionary: $e',
+          error: 'Could not save dictionary: $err',
           entries: null,
         );
       }
