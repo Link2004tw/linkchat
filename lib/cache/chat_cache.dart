@@ -6,6 +6,7 @@ import 'package:hive_flutter/hive_flutter.dart';
 import '../models/chat.dart';
 import '../models/dictionary.dart';
 import '../models/message.dart';
+import '../services/cache_encryption.dart';
 
 /// Minimal key-value storage behind the cache (a thin slice of Hive's
 /// `Box`, so tests can substitute an in-memory implementation).
@@ -58,17 +59,21 @@ class MemoryCacheStore implements CacheStore {
 /// Opens a Hive box, retrying briefly when another process holds the file
 /// lock. Returns `null` if the lock still can't be acquired (e.g. a second
 /// instance of the app is running), so callers can fall back to in-memory
-/// storage instead of crashing at startup.
+/// storage instead of crashing at startup. Decryption failures are NOT
+/// caught here — they rethrow so callers can decide to reset the box.
 ///
 /// Hive 2.x takes an exclusive OS-level lock (`flock`) on the box file when
 /// opening it, and throws `FileSystemException: lock failed ... (errno 11)`
 /// when that lock is already held. There is no opt-out for the lock in this
 /// Hive version, so we degrade gracefully.
-Future<Box<String>?> tryOpenHiveBox(String name) async {
+Future<Box<String>?> tryOpenHiveBox(
+  String name, {
+  HiveAesCipher? cipher,
+}) async {
   const maxAttempts = 3;
   for (var attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      return await Hive.openBox<String>(name);
+      return await Hive.openBox<String>(name, encryptionCipher: cipher);
     } catch (e) {
       final lockContended = e.toString().contains('lock failed');
       if (!lockContended) rethrow; // real I/O problem — surface it
@@ -98,19 +103,57 @@ class ChatCache {
   /// Opens (or reopens) the Hive-backed cache. Call once from `main()`
   /// after `Hive.initFlutter()`.
   ///
-  /// Falls back to an in-memory cache (no persistence) when the Hive box
-  /// can't be locked — e.g. another instance of the app already has it open
-  /// — so a lock hiccup never takes the app down at startup.
+  /// The box is encrypted at rest with an AES-256 key held in secure
+  /// storage — it contains decrypted dictionaries and messages. When
+  /// secure storage isn't available (or the box can't be locked by this
+  /// process), falls back to an in-memory cache so a hiccup never takes
+  /// the app down at startup — and never writes plaintext to disk.
+  ///
+  /// A box written before encryption (or corrupted) fails to decrypt; the
+  /// cache is disposable, so it's wiped and rebuilt from the network.
   static Future<ChatCache> open() async {
-    final box = await tryOpenHiveBox('chat_cache');
+    final key = await CacheEncryption().ensureKey();
+    if (key == null) {
+      debugPrint(
+        'chat_cache: secure storage unavailable — using in-memory cache '
+        '(nothing is written to disk)',
+      );
+      return ChatCache.memory;
+    }
+    final cipher = HiveAesCipher(key);
+    Box<String>? box = await _openOrReset('chat_cache', cipher);
     if (box == null) {
       debugPrint(
-        'chat_cache: could not lock Hive box (another instance running?) — '
-        'using in-memory cache',
+        'chat_cache: could not lock/open Hive box — using in-memory cache',
       );
       return ChatCache.memory;
     }
     return ChatCache(HiveCacheStore(box));
+  }
+
+  /// Opens [name] with [cipher]; on decryption failure (legacy plaintext
+  /// box or corruption) wipes the file once and retries fresh. Returns
+  /// null when the box can't be locked or opened at all — callers fall
+  /// back to in-memory.
+  static Future<Box<String>?> _openOrReset(
+    String name,
+    HiveAesCipher cipher,
+  ) async {
+    try {
+      return await tryOpenHiveBox(name, cipher: cipher);
+    } on Exception catch (e) {
+      debugPrint('chat_cache: unreadable ($e) — resetting');
+      try {
+        await Hive.deleteBoxFromDisk(name);
+      } catch (_) {
+        return null; // can't even delete — give up on persistence
+      }
+      try {
+        return await tryOpenHiveBox(name, cipher: cipher);
+      } catch (_) {
+        return null;
+      }
+    }
   }
 
   /// An in-memory cache used as the provider default in tests.
