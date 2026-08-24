@@ -3,6 +3,9 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- Voice messages (Phase 7). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- Push notifications (Android 13+ runtime permission; firebase_messaging
+         also merges this, declared explicitly for robustness). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- usesCleartextTraffic is set in src/debug/AndroidManifest.xml ONLY:
          debug builds may talk to a plain-HTTP dev backend (http://10.0.2.2:3001).
          Release builds default to HTTPS and must not allow cleartext. -->

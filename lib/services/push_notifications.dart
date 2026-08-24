@@ -64,10 +64,14 @@ class PushNotifications {
     _initializing = true;
     try {
       final messaging = FirebaseMessaging.instance;
-      await messaging.requestPermission(alert: true, badge: true, sound: true);
+      final settings = await messaging.requestPermission(alert: true, badge: true, sound: true);
+      debugPrint('push: notification permission = ${settings.authorizationStatus}');
 
       // Token refresh → keep the backend in sync.
-      messaging.onTokenRefresh.listen((token) => registerToken(token));
+      messaging.onTokenRefresh.listen((token) {
+        debugPrint('push: FCM token refreshed (${token.substring(0, 12)}…)');
+        registerToken(token);
+      });
 
       // Foreground messages.
       FirebaseMessaging.onMessage.listen((message) {
@@ -81,20 +85,32 @@ class PushNotifications {
 
       // Tap on a notification while the app is open.
       FirebaseMessaging.onMessageOpenedApp.listen((message) {
+        debugPrint('push: tapped (backgrounded app), data=${message.data}');
         _handleTap(message);
       });
 
       // App launched from a notification (cold start).
       final initial = await messaging.getInitialMessage();
-      if (initial != null) _handleTap(initial);
+      if (initial != null) {
+        debugPrint('push: cold start from notification, data=${initial.data}');
+        _handleTap(initial);
+      }
 
       // Register the current token.
       final token = await messaging.getToken();
-      if (token != null) await registerToken(token);
+      if (token == null) {
+        debugPrint('push: getToken() returned null — push will not work');
+        return;
+      }
+      debugPrint('push: FCM token acquired (${token.substring(0, 12)}…), registering');
+      await registerToken(token);
       _initialized = true;
+      debugPrint('push: ready — device registered with backend');
     } catch (e) {
-      // Firebase not configured for this platform — push disabled silently.
-      debugPrint('Push notifications init skipped: $e');
+      // Push must never break the app, but failures used to be invisible.
+      // This line names the actual cause (API not enabled, mismatched
+      // google-services.json, no Play services, …).
+      debugPrint('push: INIT FAILED — notifications disabled. Cause: $e');
     } finally {
       _initializing = false;
     }
