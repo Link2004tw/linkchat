@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="robots" content="noindex">
+  <title>Sign-in complete</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      text-align: center;
+      padding-top: 4rem;
+      color: #1f2937;
+      background: #f9fafb;
+    }
+    h3 { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <!--
+    OAuth redirect target for the web popup flow (see
+    lib/services/google_oauth_callback_web.dart). Clerk redirects the popup
+    here with ?rotating_token_nonce=... after Google auth; the main window
+    reads this same-origin URL to complete the sign-in.
+  -->
+  <h3>Signed in! You can close this window and return to the app.</h3>
+
+  <script>
+    // Close ourselves once the main window has had a chance to read our
+    // URL (it polls every 400 ms). window.close() only works for windows
+    // opened by script, so a manually-opened tab simply stays open.
+    setTimeout(function () {
+      window.close();
+    }, 1500);
+  </script>
+</body>
+</html>
