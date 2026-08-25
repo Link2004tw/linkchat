@@ -29,8 +29,41 @@ class DictEntry {
   String toString() => '$code → $meaning';
 }
 
+/// KDF parameters of a passphrase-locked ("locked-v1") dictionary. The
+/// salt and iteration count are public by design — secrecy lives entirely
+/// in the passphrase.
+class DictionaryLockMeta {
+  const DictionaryLockMeta({
+    required this.alg,
+    required this.salt,
+    required this.iterations,
+  });
+
+  static const String defaultAlg = 'pbkdf2-sha256';
+  static const int defaultIterations = 600000;
+
+  final String alg;
+  final String salt;
+  final int iterations;
+
+  bool get isValid =>
+      alg == defaultAlg && salt.isNotEmpty && iterations > 0;
+
+  factory DictionaryLockMeta.fromJson(Map<String, dynamic> json) =>
+      DictionaryLockMeta(
+        alg: asString(json['alg']) ?? defaultAlg,
+        salt: asString(json['salt']) ?? '',
+        iterations: asInt(json['iterations']) ?? 0,
+      );
+
+  Map<String, dynamic> toJson() =>
+      {'alg': alg, 'salt': salt, 'iterations': iterations};
+}
+
 /// The raw encrypted dictionary + everything needed to (re)wrap the shared
-/// chat key. Entries are produced by decrypting with the chat key.
+/// chat key. Entries are produced by decrypting with the chat key — or,
+/// for passphrase-locked dictionaries ([lock] != null), with the key
+/// derived from the shared lock passphrase (no wraps involved).
 class DictionaryContext {
   const DictionaryContext({
     this.ciphertext,
@@ -39,6 +72,7 @@ class DictionaryContext {
     required this.version,
     required this.wraps,
     required this.participants,
+    this.lock,
   });
 
   /// Null when the chat has no dictionary yet (lazy init on first use).
@@ -48,12 +82,19 @@ class DictionaryContext {
   final int version;
 
   /// wrap-key (`userId:deviceId`) → wrap, for staleness checks in the UI.
+  /// Empty for passphrase-locked dictionaries.
   final Map<String, DictionaryWrap> wraps;
 
   /// Chat participants with their public keys (for wrapping).
   final List<DictionaryMember> participants;
 
+  /// Non-null when the dictionary is passphrase-locked ("locked-v1").
+  final DictionaryLockMeta? lock;
+
   bool get exists => ciphertext != null;
+
+  /// True when access requires the shared lock passphrase.
+  bool get isLocked => lock != null;
 
   factory DictionaryContext.fromJson(Map<String, dynamic> json) {
     final dictionary = json['dictionary'];
@@ -71,6 +112,9 @@ class DictionaryContext {
             .map(DictionaryWrap.fromJson)
             .toList()
         : const <DictionaryWrap>[];
+    final kdf = dictionaryMap != null && dictionaryMap['kdf'] is Map<String, dynamic>
+        ? DictionaryLockMeta.fromJson(dictionaryMap['kdf'] as Map<String, dynamic>)
+        : null;
 
     return DictionaryContext(
       ciphertext: asString(dictionaryMap?['ciphertext']),
@@ -79,6 +123,7 @@ class DictionaryContext {
       version: asInt(dictionaryMap?['version']) ?? 0,
       wraps: {for (final w in rawWraps) w.key: w},
       participants: participants,
+      lock: kdf,
     );
   }
 

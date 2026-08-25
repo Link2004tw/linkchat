@@ -15,6 +15,8 @@ abstract class CacheStore {
 
   Future<void> put(String key, String value);
 
+  Future<void> delete(String key);
+
   Future<void> clear();
 
   bool get isEmpty;
@@ -33,6 +35,9 @@ class HiveCacheStore implements CacheStore {
   Future<void> put(String key, String value) => _box.put(key, value);
 
   @override
+  Future<void> delete(String key) => _box.delete(key);
+
+  @override
   Future<void> clear() => _box.clear();
 
   @override
@@ -48,6 +53,9 @@ class MemoryCacheStore implements CacheStore {
 
   @override
   Future<void> put(String key, String value) async => _data[key] = value;
+
+  @override
+  Future<void> delete(String key) async => _data.remove(key);
 
   @override
   Future<void> clear() async => _data.clear();
@@ -253,4 +261,10 @@ class ChatCache {
         '$_dictPrefix$chatId',
         jsonEncode([for (final e in entries) e.toJson()]),
       );
+
+  /// Drops cached entries for [chatId] — used when a dictionary turns out
+  /// to be passphrase-locked, so stale plaintext meanings can't linger on
+  /// disk while the chat is locked.
+  Future<void> deleteDictionary(String chatId) =>
+      _store.delete('$_dictPrefix$chatId');
 }

@@ -21,6 +21,7 @@ class DictionaryState {
     this.wraps = const {},
     this.needsRekey = false,
     this.hasDictionary = false,
+    this.isLocked = false,
     this.error,
   });
 
@@ -39,6 +40,11 @@ class DictionaryState {
   /// Whether a dictionary exists server-side (false = lazy init not done).
   final bool hasDictionary;
 
+  /// True when the dictionary is passphrase-locked and this session has
+  /// not unlocked it yet: entries are unavailable, tap-to-reveal and the
+  /// dictionary screen are gated behind [DictionaryController.unlock].
+  final bool isLocked;
+
   final String? error;
 
   DictionaryState copyWith({
@@ -49,6 +55,7 @@ class DictionaryState {
     Map<String, DictionaryWrap>? wraps,
     bool? needsRekey,
     bool? hasDictionary,
+    bool? isLocked,
     bool clearError = false,
     String? error,
   }) =>
@@ -60,6 +67,7 @@ class DictionaryState {
         wraps: wraps ?? this.wraps,
         needsRekey: needsRekey ?? this.needsRekey,
         hasDictionary: hasDictionary ?? this.hasDictionary,
+        isLocked: isLocked ?? this.isLocked,
         error: clearError ? null : (error ?? this.error),
       );
 }
@@ -68,9 +76,25 @@ class DictionaryState {
 /// device-local ([DictionaryCrypto]); the repository moves opaque blobs.
 /// The chat AES key lives in memory while loaded and is mirrored into
 /// secure storage so a stale wrap can self-heal without another member.
+///
+/// Passphrase-locked ("locked-v1") dictionaries replace the chat key with
+/// a key derived from a shared passphrase. The derived key ([_lockKey])
+/// and its metadata live in memory ONLY — every app launch starts locked
+/// again, and nothing passphrase-related is ever persisted.
 class DictionaryController
     extends AutoDisposeFamilyNotifier<DictionaryState, String> {
   Uint8List? _chatKey;
+
+  /// Derived lock key of a locked dictionary while the session holds it.
+  Uint8List? _lockKey;
+
+  /// KDF metadata of the locked variant this controller is working with
+  /// (set on unlock / create / rotate; cleared when a legacy blob loads).
+  DictionaryLockMeta? _activeLockMeta;
+
+  /// Raw locked blob awaiting a passphrase (non-null ⇔ locked & not yet
+  /// unlocked this session).
+  DictionaryContext? _lockedContext;
 
   /// In-flight guard so concurrent reloads (WS `dictionary-update` pings,
   /// conflict retries) share one `_load` instead of racing each other.
@@ -121,6 +145,15 @@ class DictionaryController
       }
 
       final context = await repo.getDictionary(chatId);
+
+      // Passphrase-locked ("locked-v1") dictionaries never touch the
+      // device-key/wrap machinery below — access is the passphrase alone.
+      if (context.isLocked) {
+        await _applyLockedContext(context);
+        return;
+      }
+      _activeLockMeta = null;
+      _lockedContext = null;
 
       // Find my device's entry (participants are per member-device).
       final myMember = context.memberFor(myClerkId, deviceId);
@@ -241,6 +274,201 @@ class DictionaryController
   }
 
   Future<void> reload() => _load();
+
+  // ── Passphrase lock ("locked-v1") ──────────────────────────────────────
+
+  /// Enters the locked branch: purge any cached plaintext (a stale cache
+  /// must not leak meanings while the chat is locked), then either
+  /// re-decrypt with this session's key or park the blob until
+  /// [unlock] is called.
+  Future<void> _applyLockedContext(DictionaryContext context) async {
+    try {
+      await ref.read(chatCacheProvider).deleteDictionary(chatId);
+    } catch (_) {}
+    _chatKey = null;
+    _activeLockMeta = context.lock;
+
+    final key = _lockKey;
+    if (key != null) {
+      try {
+        final entries = await ref.read(dictionaryCryptoProvider).decryptEntries(
+              ciphertext: context.ciphertext!,
+              iv: context.iv!,
+              authTag: context.authTag!,
+              chatKey: key,
+            );
+        _lockedContext = null;
+        state = DictionaryState(
+          isLoading: false,
+          entries: entries,
+          version: context.version,
+          participants: context.participants,
+          hasDictionary: true,
+        );
+        _cacheUnlocked(entries);
+        return;
+      } catch (_) {
+        // The blob was re-keyed (e.g. an owner reset) — our session key is
+        // dead; drop it and show the locked state again.
+        debugPrint('dictionary[$chatId]: session lock key no longer decrypts — re-locking');
+        _lockKey = null;
+      }
+    }
+
+    _lockedContext = context;
+    state = DictionaryState(
+      isLoading: false,
+      entries: const [],
+      version: context.version,
+      participants: context.participants,
+      wraps: const {},
+      needsRekey: false,
+      hasDictionary: true,
+      isLocked: true,
+    );
+  }
+
+  Future<void> _cacheUnlocked(List<DictEntry> entries) async {
+    try {
+      await ref.read(chatCacheProvider).writeDictionary(chatId, entries);
+    } on StateError {
+      // Provider disposed mid-write — fine.
+    }
+  }
+
+  /// Attempts to unlock the locked dictionary with [passphrase]. A wrong
+  /// passphrase fails GCM authentication and surfaces as an error — there
+  /// is no attempt limiting (the secret strength IS the limit).
+  Future<({bool ok, String? error})> unlock(String passphrase) async {
+    final context = _lockedContext;
+    if (context == null || !context.isLocked) {
+      return (ok: false, error: 'Nothing to unlock');
+    }
+    if (passphrase.isEmpty) {
+      return (ok: false, error: 'Enter the passphrase');
+    }
+    final crypto = ref.read(dictionaryCryptoProvider);
+    try {
+      final key = await crypto.deriveLockKey(
+        passphrase: passphrase,
+        meta: context.lock!,
+      );
+      final entries = await crypto.decryptEntries(
+        ciphertext: context.ciphertext!,
+        iv: context.iv!,
+        authTag: context.authTag!,
+        chatKey: key,
+      );
+      _lockKey = key;
+      _activeLockMeta = context.lock;
+      _lockedContext = null;
+      state = DictionaryState(
+        isLoading: false,
+        entries: entries,
+        version: context.version,
+        participants: context.participants,
+        hasDictionary: true,
+      );
+      _cacheUnlocked(entries);
+      debugPrint('dictionary[$chatId]: unlocked at v${context.version}');
+      return (ok: true, error: null);
+    } catch (e) {
+      debugPrint('dictionary[$chatId]: unlock failed (wrong passphrase?)');
+      return (ok: false, error: 'Wrong passphrase');
+    }
+  }
+
+  /// Drops the session's unlocked state; the next load returns to locked.
+  Future<void> lock() async {
+    if (_lockKey == null && !state.hasDictionary) return;
+    _lockKey = null;
+    await reload();
+  }
+
+  /// Owner reset while locked: sets a NEW passphrase without knowing the
+  /// old one. Authority comes from membership/admin, not the secret, so
+  /// the dictionary starts over with empty entries — everyone must enter
+  /// the new passphrase and re-add their code words.
+  Future<({bool ok, String? error})> resetLockKey(String newPassphrase) async {
+    final repo = ref.read(dictionaryRepositoryProvider);
+    final crypto = ref.read(dictionaryCryptoProvider);
+    final context = _lockedContext;
+    if (context == null || !context.isLocked) {
+      return (ok: false, error: 'Dictionary is not locked');
+    }
+    if (newPassphrase.isEmpty) {
+      return (ok: false, error: 'Enter a new passphrase');
+    }
+    try {
+      final meta = await crypto.createLockMeta();
+      final key = await crypto.deriveLockKey(
+        passphrase: newPassphrase,
+        meta: meta,
+      );
+      final blob =
+          await crypto.encryptEntries(entries: const [], chatKey: key);
+      final version = await repo.saveDictionary(
+        chatId: chatId,
+        version: context.version + 1,
+        ciphertext: blob.ciphertext,
+        iv: blob.iv,
+        authTag: blob.authTag,
+        lock: meta,
+      );
+      _lockKey = key;
+      _activeLockMeta = meta;
+      _lockedContext = null;
+      state = DictionaryState(
+        isLoading: false,
+        entries: const [],
+        version: version,
+        participants: context.participants,
+        hasDictionary: true,
+      );
+      debugPrint('dictionary[$chatId]: lock key reset at v$version');
+      return (ok: true, error: null);
+    } on ApiException catch (e) {
+      debugPrint('dictionary[$chatId]: lock reset rejected (${e.statusCode})');
+      return (
+        ok: false,
+        error: e.statusCode == 409
+            ? 'Dictionary changed — please try again'
+            : 'Could not reset lock: ${e.message}',
+      );
+    } catch (e) {
+      debugPrint('dictionary[$chatId]: lock reset failed: $e');
+      return (ok: false, error: 'Could not reset lock: $e');
+    }
+  }
+
+  /// Opts a legacy (wrap-based) dictionary into the lock: re-encrypts the
+  /// current entries under a passphrase-derived key and drops the wraps.
+  /// Requires a decrypted session ([state.entries] populated).
+  Future<({bool ok, String? error})> addLock(String passphrase) async {
+    final crypto = ref.read(dictionaryCryptoProvider);
+    if (!state.hasDictionary || state.isLocked) {
+      return (ok: false, error: 'No unlockable dictionary to lock');
+    }
+    if (state.needsRekey) {
+      return (ok: false, error: 'Fix the dictionary first (start over)');
+    }
+    if (passphrase.isEmpty) {
+      return (ok: false, error: 'Enter a passphrase');
+    }
+    try {
+      final meta = await crypto.createLockMeta();
+      final saved = await _saveLocked(
+        entries: [for (final e in state.entries) if (e.isValid) e],
+        passphrase: passphrase,
+        meta: meta,
+      );
+      debugPrint('dictionary[$chatId]: lock added at v${saved.version}');
+      return (ok: true, error: null);
+    } catch (e) {
+      debugPrint('dictionary[$chatId]: addLock failed: $e');
+      return (ok: false, error: 'Could not add lock: $e');
+    }
+  }
 
   /// The pre-registry wrap (`userId:default`), but only when it was made
   /// against this device's key — i.e. this device adopted the legacy slot
@@ -455,17 +683,129 @@ class DictionaryController
     }
   }
 
+  /// Locked-variant save: encrypts [entries] under the session lock key
+  /// (or one freshly derived from [passphrase]) and PUTs a "locked-v1"
+  /// payload — no wraps, no coverage. On a 409 the freshest blob is
+  /// fetched, merged and retried (the other member must have used the
+  /// same passphrase to save at all).
+  Future<({int version, List<DictEntry> entries})> _saveLocked(
+    List<DictEntry> entries, {
+    String? passphrase,
+  }) async {
+    final crypto = ref.read(dictionaryCryptoProvider);
+    final repo = ref.read(dictionaryRepositoryProvider);
+
+    var meta = _activeLockMeta;
+    var key = _lockKey;
+    if (key == null || meta == null) {
+      if (passphrase == null || passphrase.isEmpty) {
+        throw StateError('A locked save needs the lock passphrase');
+      }
+      meta = await crypto.createLockMeta();
+      key = await crypto.deriveLockKey(passphrase: passphrase, meta: meta);
+    }
+
+    var merged = entries;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final blob =
+            await crypto.encryptEntries(entries: merged, chatKey: key!);
+        final version = await repo.saveDictionary(
+          chatId: chatId,
+          version: state.version + 1,
+          ciphertext: blob.ciphertext,
+          iv: blob.iv,
+          authTag: blob.authTag,
+          lock: meta!,
+        );
+        _lockKey = key;
+        _activeLockMeta = meta;
+        state = DictionaryState(
+          isLoading: false,
+          entries: merged,
+          version: version,
+          participants: state.participants,
+          hasDictionary: true,
+        );
+        _cacheUnlocked(merged);
+        return (version: version, entries: merged);
+      } on ApiException catch (e) {
+        if (e.statusCode != 409 || attempt == 2) rethrow;
+        debugPrint(
+          'dictionary[$chatId]: locked save hit a conflict (${e.message}) — merging',
+        );
+        await _load();
+        if (state.isLocked) {
+          // The winner used a DIFFERENT passphrase (owner reset) — our
+          // session key can't read their blob anymore.
+          throw StateError('The lock was changed by another member');
+        }
+        merged = DictionaryCrypto.mergeDictionaryEntries(
+          remote: state.entries,
+          local: merged,
+        );
+      }
+    }
+    throw ApiException(
+      409,
+      'Dictionary changed too many times — please try again',
+    );
+  }
+
   /// Saves [entries]: re-encrypts under the chat key (creating it on first
   /// use), wraps for every participant with a public key, then PUTs.
   /// After a save all current members are rewrapped.
+  ///
+  /// Passphrase-locked dictionaries take the [DictionaryController._saveLocked]
+  /// path instead: [lockPassphrase] must be supplied when CREATING a new
+  /// locked dictionary (there is no session key yet); afterwards the
+  /// in-memory session key suffices until the next app launch.
   ///
   /// When a concurrent save wins (backend 409 version conflict), reloads the
   /// freshest dictionary, merges [entries] on top ([mergeDictionaryEntries]),
   /// and retries — so both members keep their edits. Returns the final saved
   /// entry set via `entries` so callers can sync their local copy.
   Future<({bool ok, String? error, List<DictEntry>? entries})> save(
-    List<DictEntry> entries,
-  ) async {
+    List<DictEntry> entries, {
+    String? lockPassphrase,
+  }) async {
+    if (state.isLocked) {
+      return (
+        ok: false,
+        error: 'Unlock the dictionary with the passphrase first',
+        entries: null,
+      );
+    }
+    final useLock = _activeLockMeta != null ||
+        (lockPassphrase != null && lockPassphrase.isNotEmpty);
+    if (useLock && _lockKey == null && (lockPassphrase == null || lockPassphrase.isEmpty)) {
+      return (
+        ok: false,
+        error: 'Set a lock passphrase to create the dictionary',
+        entries: null,
+      );
+    }
+    if (useLock) {
+      try {
+        final saved = await _saveLocked(
+          [for (final e in entries) if (e.isValid) e],
+          passphrase: lockPassphrase,
+        );
+        return (ok: true, error: null, entries: saved.entries);
+      } on ApiException catch (e) {
+        debugPrint('dictionary[$chatId]: locked save rejected (${e.statusCode})');
+        return (
+          ok: false,
+          error: e.statusCode == 409
+              ? 'Dictionary changed too many times — please try again'
+              : 'Could not save dictionary: ${e.message}',
+          entries: null,
+        );
+      } catch (err) {
+        debugPrint('dictionary[$chatId]: locked save failed: $err');
+        return (ok: false, error: 'Could not save dictionary: $err', entries: null);
+      }
+    }
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
         if (state.isLoading) {

@@ -21,24 +21,36 @@ class DictionaryRepository {
     );
   }
 
-  /// Saves a fully re-encrypted dictionary: the new ciphertext blob plus a
-  /// wrap for every current participant. Version must strictly increase.
+  /// Saves a fully re-encrypted dictionary. Legacy payloads carry a wrap
+  /// for every current participant; locked ("locked-v1") payloads pass
+  /// [lock] instead and omit wraps. Version must strictly increase.
   Future<int> saveDictionary({
     required String chatId,
     required int version,
     required String ciphertext,
     required String iv,
     required String authTag,
-    required List<DictionaryWrap> wraps,
+    List<DictionaryWrap> wraps = const [],
+    DictionaryLockMeta? lock,
   }) async {
+    final dictionary = lock != null
+        ? {
+            'ciphertext': ciphertext,
+            'iv': iv,
+            'authTag': authTag,
+            'version': version,
+            'format': 'locked-v1',
+            'kdf': lock.toJson(),
+          }
+        : {
+            'ciphertext': ciphertext,
+            'iv': iv,
+            'authTag': authTag,
+            'version': version,
+            'wraps': [for (final w in wraps) w.toJson()],
+          };
     final data = await _api.put('/chats/$chatId/dictionary', body: {
-      'dictionary': {
-        'ciphertext': ciphertext,
-        'iv': iv,
-        'authTag': authTag,
-        'version': version,
-        'wraps': [for (final w in wraps) w.toJson()],
-      },
+      'dictionary': dictionary,
     });
     final map = data is Map<String, dynamic> ? data : const {};
     return (map['version'] as num?)?.toInt() ?? version;

@@ -7,11 +7,18 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../models/dictionary.dart';
 
-/// Everything about the encrypted per-chat dictionary lives client-side:
-/// each device generates an X25519 keypair (seed in secure storage), the
-/// shared chat AES key is wrapped per-member with X25519 + AES-GCM, and the
-/// dictionary entries are AES-256-GCM ciphertext under that chat key. This
-/// class owns the crypto; it never talks to the network.
+/// Everything about the encrypted per-chat dictionary lives client-side.
+///
+/// Two access models exist:
+/// - Legacy: each device generates an X25519 keypair (seed in secure
+///   storage), the shared chat AES key is wrapped per-member with
+///   X25519 + AES-GCM, and entries are AES-256-GCM ciphertext under that
+///   chat key.
+/// - Passphrase-locked ("locked-v1"): entries are AES-256-GCM ciphertext
+///   under a key derived from a shared passphrase (PBKDF2-HMAC-SHA256);
+///   there are no wraps — possessing the passphrase IS access.
+///
+/// This class owns the crypto; it never talks to the network.
 class DictionaryCrypto {
   DictionaryCrypto({FlutterSecureStorage? storage})
       : _storage = storage ?? const FlutterSecureStorage();
@@ -210,6 +217,73 @@ class DictionaryCrypto {
         .whereType<Map<String, dynamic>>()
         .map(DictEntry.fromJson)
         .toList();
+  }
+
+  // ── Passphrase lock ("locked-v1") ─────────────────────────────────────
+
+  static final Pbkdf2 _pbkdf2 = Pbkdf2(
+    macAlgorithm: Hmac.sha256(),
+    bits: 256,
+    iterations: DictionaryLockMeta.defaultIterations,
+  );
+
+  /// Fresh KDF metadata for a new/rotated lock: a random 16-byte salt.
+  Future<DictionaryLockMeta> createLockMeta() async {
+    final rng = Random.secure();
+    final salt = base64Encode(
+      Uint8List.fromList(List.generate(16, (_) => rng.nextInt(256))),
+    );
+    return DictionaryLockMeta(
+      alg: DictionaryLockMeta.defaultAlg,
+      salt: salt,
+      iterations: DictionaryLockMeta.defaultIterations,
+    );
+  }
+
+  /// Derives the AES key for a locked dictionary from [passphrase] using
+  /// the blob's public [meta]. A wrong passphrase yields a key that fails
+  /// GCM authentication at decrypt time — it cannot be detected here.
+  Future<Uint8List> deriveLockKey({
+    required String passphrase,
+    required DictionaryLockMeta meta,
+  }) async {
+    if (!meta.isValid) {
+      throw ArgumentError('Invalid dictionary lock metadata');
+    }
+    final derived = await _pbkdf2.deriveKey(
+      passphrase: utf8.encode(passphrase),
+      nonce: base64Decode(meta.salt),
+    );
+    return Uint8List.fromList(await derived.extractBytes());
+  }
+
+  /// Encrypts [entries] under the key derived from [passphrase].
+  Future<({String ciphertext, String iv, String authTag})>
+      encryptEntriesLocked({
+    required List<DictEntry> entries,
+    required String passphrase,
+    required DictionaryLockMeta meta,
+  }) async {
+    final key = await deriveLockKey(passphrase: passphrase, meta: meta);
+    return encryptEntries(entries: entries, chatKey: key);
+  }
+
+  /// Decrypts a locked dictionary blob with [passphrase]. Throws when the
+  /// passphrase is wrong (GCM auth-tag mismatch) or the blob is corrupt.
+  Future<List<DictEntry>> decryptEntriesLocked({
+    required String ciphertext,
+    required String iv,
+    required String authTag,
+    required String passphrase,
+    required DictionaryLockMeta meta,
+  }) async {
+    final key = await deriveLockKey(passphrase: passphrase, meta: meta);
+    return decryptEntries(
+      ciphertext: ciphertext,
+      iv: iv,
+      authTag: authTag,
+      chatKey: key,
+    );
   }
 
   // ── Message transforms (pure) ────────────────────────────────────────
