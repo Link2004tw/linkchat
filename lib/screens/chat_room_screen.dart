@@ -17,6 +17,7 @@ import '../utils/media_picker.dart';
 import '../utils/save_image.dart';
 import '../utils/snack.dart';
 import '../widgets/chat/chat_input_bar.dart';
+import '../widgets/chat/dictionary_unlock_sheet.dart';
 import '../widgets/chat/message_list.dart';
 import '../widgets/chat/message_search_sheet.dart';
 import '../widgets/chat/typing_banner.dart';
