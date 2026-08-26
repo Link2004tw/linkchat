@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/markdown_util.dart';
 import '../../models/user.dart';
 import '../user_avatar.dart';
 import 'link_launcher.dart';
+import 'user_profile_sheet.dart';
 
 /// Renders a text message body as markdown (headings, bold/italic,
 /// strikethrough, code blocks, links). Bare URLs are wrapped by
@@ -114,7 +116,8 @@ void _showMentionSheet(BuildContext context, MentionToken token) {
   final isAll = token.userId == 'all';
   showModalBottomSheet<void>(
     context: context,
-    builder: (ctx) => SafeArea(
+    builder: (ctx) => Consumer(
+      builder: (ctx, sheetRef, _) => SafeArea(
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: isAll
@@ -151,7 +154,15 @@ void _showMentionSheet(BuildContext context, MentionToken token) {
                   style: Theme.of(ctx).textTheme.titleMedium,
                 ),
                 subtitle: Text(token.userId),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => openUserFromAvatar(
+                  ctx,
+                  sheetRef,
+                  clerkId: token.userId,
+                  user: ChatUser(clerkId: token.userId, username: token.name),
+                ),
               ),
+      ),
       ),
     ),
   );

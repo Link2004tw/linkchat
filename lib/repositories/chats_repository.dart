@@ -146,13 +146,18 @@ class ChatsRepository {
     await _api.delete('/chats/$chatId/members/$targetUserId/mute');
   }
 
-  /// `PUT /chats/:chatId/mute-me` — self-mute toggle.
-  Future<bool> muteSelf(String chatId) async {
-    final data = await _api.put('/chats/$chatId/mute-me');
+  /// `PUT /chats/:chatId/mute-me` — self-mute notifications for a duration
+  /// (`8h`, `1d`, `1w`, `forever`; backend defaults to forever). Mute is
+  /// notifications-only and never blocks reading or sending.
+  Future<bool> muteSelf(String chatId, {String duration = 'forever'}) async {
+    final data = await _api.put(
+      '/chats/$chatId/mute-me',
+      body: {'duration': duration},
+    );
     return data is Map<String, dynamic> && data['mutedByUser'] == true;
   }
 
-  /// `DELETE /chats/:chatId/mute-me` — unmute self.
+  /// `DELETE /chats/:id/mute-me` — unmute self.
   Future<bool> unmuteSelf(String chatId) async {
     final data = await _api.delete('/chats/$chatId/mute-me');
     return data is Map<String, dynamic> && data['mutedByUser'] == true;

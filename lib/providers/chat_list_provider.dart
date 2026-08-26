@@ -273,6 +273,9 @@ List<ChatSummary> reduceChatList(
           pictureUrl: updates['pictureUrl'] is String
               ? updates['pictureUrl'] as String
               : null,
+          mutedByUser: updates['mutedByUser'] is bool
+              ? updates['mutedByUser'] as bool
+              : null,
         ),
       );
       if (updated == null) {
@@ -405,6 +408,20 @@ class ChatListController extends AutoDisposeNotifier<AsyncValue<List<ChatSummary
   Future<void> refresh() async {
     final chats = await ref.read(chatsRepositoryProvider).getAll();
     state = AsyncData(chats);
+    _persist();
+  }
+
+  /// Optimistically flips the self-mute flag for one chat (chat-list
+  /// long-press menu). The server's `room-update {mutedByUser}` echo
+  /// confirms; a REST refresh overwrites it if they ever diverge.
+  void setSelfMuted(String chatId, bool muted) {
+    final updated = _updateChat(
+      state.valueOrNull ?? const [],
+      chatId,
+      (c) => c.copyWith(mutedByUser: muted),
+    );
+    if (updated == null) return;
+    state = AsyncData(updated);
     _persist();
   }
 

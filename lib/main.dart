@@ -13,6 +13,8 @@ import 'core/config.dart';
 import 'providers/chat_list_provider.dart';
 import 'providers/theme_provider.dart';
 import 'screens/auth_gate.dart';
+import 'services/chat_list_notification_router.dart';
+import 'services/local_notifications.dart';
 import 'services/push_wiring.dart';
 
 /// Entry point. Wraps the app in a guarded zone so stray asynchronous
@@ -48,6 +50,9 @@ Future<void> _main() async {
   final prefs = await ThemePrefs.open();
   // No-op until Firebase is configured (then initializes the SDK).
   await initializeFirebaseIfAvailable();
+  // Linux desktop: local notifications (no FCM there). No-op elsewhere.
+  await initializeLocalNotificationsIfAvailable();
+  appFocusTracker.register();
 
   // Render the first frame BEFORE the Clerk bootstrap runs — it makes live
   // network calls with retries, and blocking `runApp` behind them left a
@@ -80,6 +85,9 @@ class ChatApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = ref.watch(appThemeProvider);
+    // Linux desktop: route WS messages to local notifications (no-op on
+    // other platforms; the provider itself is platform-gated).
+    ref.watch(localNotificationRouterProvider);
 
     // Splash/retry gate while the Clerk auth state is being created; once
     // ready, ClerkAuth wraps MaterialApp exactly as before so every route

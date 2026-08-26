@@ -11,6 +11,7 @@ class UserAvatar extends StatelessWidget {
     this.radius = 20,
     this.showStatusDot = false,
     this.isOnline = false,
+    this.onTap,
   });
 
   final ChatUser user;
@@ -23,6 +24,10 @@ class UserAvatar extends StatelessWidget {
   /// Whether the online dot is filled (green) or hollow (gray). Only
   /// meaningful when [showStatusDot] is true.
   final bool isOnline;
+
+  /// When set, tapping the avatar triggers it (e.g. open the user's
+  /// profile sheet).
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -39,7 +44,10 @@ class UserAvatar extends StatelessWidget {
       child: hasImage ? null : Text(initial),
     );
 
-    if (!showStatusDot) return avatar;
+    final wrapped =
+        onTap == null ? avatar : InkWell(customBorder: const CircleBorder(), onTap: onTap, child: avatar);
+
+    if (!showStatusDot) return wrapped;
 
     final dotRadius = radius * 0.3;
     final dotColor = isOnline ? Colors.green : theme.colorScheme.outline;
@@ -48,7 +56,7 @@ class UserAvatar extends StatelessWidget {
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        avatar,
+        wrapped,
         Positioned(
           right: -dotRadius * 0.4,
           bottom: -dotRadius * 0.4,

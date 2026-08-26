@@ -22,6 +22,24 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 
 import 'package:flutter/material.dart';
 
+import 'push_wiring.dart' show firebaseReady, initializeFirebaseIfAvailable;
+import 'battery_optimization.dart' show isIgnoringBatteryOptimizations;
+
+/// Top-level background handler — REQUIRED to be a top-level (or static)
+/// function annotated `@pragma('vm:entry-point')` so it survives AOT
+/// tree-shaking. Fires for data-only messages and notification taps that
+/// arrive while the app is detached/killed; without it, killed-app delivery
+/// depends entirely on the system tray posting the notification payload.
+@pragma('vm:entry-point')
+Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  debugPrint(
+    'push: background message type=${message.data['type']} '
+    'chatId=${message.data['chatId']}',
+  );
+  // Notification payloads are posted to the system tray by Android itself
+  // (`messages` channel); nothing else to do here yet.
+}
+
 /// FCM wiring for the app. Call [init] after sign-in (it registers the
 /// device token with the backend) and [dispose] on sign-out.
 ///
@@ -63,6 +81,26 @@ class PushNotifications {
     if (_initializing || _initialized) return;
     _initializing = true;
     try {
+      // The [DEFAULT] Firebase app must exist before any messaging call —
+      // main() initializes it, but if that failed (or raced), retry once
+      // here instead of dying with `[core/no-app]`.
+      if (!firebaseReady) {
+        await initializeFirebaseIfAvailable();
+        if (!firebaseReady) {
+          debugPrint(
+            'push: INIT FAILED — no Firebase app. On desktop (Linux/Windows '
+            'without config) FCM is unavailable by design; test notifications '
+            'on an Android/iOS build. Otherwise see the "Firebase init FAILED" '
+            'line above for the cause.',
+          );
+          return;
+        }
+      }
+
+      // Register the background handler before anything else so messages
+      // arriving while the app is killed/detached are handled.
+      FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+
       final messaging = FirebaseMessaging.instance;
       final settings = await messaging.requestPermission(alert: true, badge: true, sound: true);
       debugPrint('push: notification permission = ${settings.authorizationStatus}');
@@ -105,7 +143,13 @@ class PushNotifications {
       debugPrint('push: FCM token acquired (${token.substring(0, 12)}…), registering');
       await registerToken(token);
       _initialized = true;
-      debugPrint('push: ready — device registered with backend');
+      // OEM battery managers are the #1 cause of "no notifications when the
+      // app is swiped away" — surface the exemption state in every init.
+      final batteryOk = await isIgnoringBatteryOptimizations();
+      debugPrint(
+        'push: ready — device registered; '
+        'battery optimization ignored = $batteryOk',
+      );
     } catch (e) {
       // Push must never break the app, but failures used to be invisible.
       // This line names the actual cause (API not enabled, mismatched

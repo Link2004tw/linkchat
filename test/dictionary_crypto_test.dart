@@ -304,4 +304,76 @@ void main() {
       expect(merged.map((e) => e.code), ['a', 'm', 'x']);
     });
   });
+
+  group('passphrase lock (locked-v1)', () {
+    test('createLockMeta produces a valid random-salt meta', () async {
+      final crypto = DictionaryCrypto();
+      final meta = await crypto.createLockMeta();
+      expect(meta.isValid, isTrue);
+      final other = await crypto.createLockMeta();
+      expect(other.salt, isNot(meta.salt));
+    });
+
+    test('encrypt/decrypt round-trips with the passphrase', () async {
+      final crypto = DictionaryCrypto();
+      final meta = await crypto.createLockMeta();
+      final blob = await crypto.encryptEntriesLocked(
+        entries: [_e('m', 'Mark'), _e('h', 'home')],
+        passphrase: 'correct horse',
+        meta: meta,
+      );
+      final entries = await crypto.decryptEntriesLocked(
+        ciphertext: blob.ciphertext,
+        iv: blob.iv,
+        authTag: blob.authTag,
+        passphrase: 'correct horse',
+        meta: meta,
+      );
+      expect(entries.map((e) => e.meaning), ['Mark', 'home']);
+    });
+
+    test('a wrong passphrase fails authentication (not garbage)', () async {
+      final crypto = DictionaryCrypto();
+      final meta = await crypto.createLockMeta();
+      final blob = await crypto.encryptEntriesLocked(
+        entries: [_e('m', 'Mark')],
+        passphrase: 'right',
+        meta: meta,
+      );
+      await expectLater(
+        crypto.decryptEntriesLocked(
+          ciphertext: blob.ciphertext,
+          iv: blob.iv,
+          authTag: blob.authTag,
+          passphrase: 'wrong',
+          meta: meta,
+        ),
+        throwsA(isA<SecretBoxAuthenticationError>()),
+      );
+    });
+
+    test('deriveLockKey is deterministic and salt-dependent', () async {
+      final crypto = DictionaryCrypto();
+      final a = await crypto.createLockMeta();
+      final b = await crypto.createLockMeta();
+      final k1 = await crypto.deriveLockKey(passphrase: 'pw', meta: a);
+      final k2 = await crypto.deriveLockKey(passphrase: 'pw', meta: a);
+      final k3 = await crypto.deriveLockKey(passphrase: 'pw', meta: b);
+      expect(k1, k2);
+      expect(k1, isNot(k3));
+    });
+
+    test('invalid metadata is rejected before deriving', () async {
+      final crypto = DictionaryCrypto();
+      const bad = DictionaryLockMeta(
+        alg: 'argon2',
+        salt: 'salt',
+        iterations: 600000,
+      );
+      expect(
+        () => crypto.deriveLockKey(passphrase: 'pw', meta: bad),
+        throwsArgumentError,
+      );
+    });
+  });
 }

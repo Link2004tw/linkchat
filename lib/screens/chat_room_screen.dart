@@ -84,12 +84,16 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
   /// reset) can't trigger an endless clear-and-refetch loop.
   bool _staleLockHealed = false;
 
+  /// Guards the automatic unlock prompt so a locked chat shows the
+  /// passphrase sheet once per room open, not on every rebuild.
+  bool _unlockPrompted = false;
+
   /// Whether the current user has self-muted this chat.
   bool get _isMutedByUser {
     final me = ref.read(currentUserProvider)?.clerkId;
     if (me == null || _info == null) return false;
     final myParticipant = _info!.participants.where((p) => p.clerkId == me);
-    return myParticipant.any((p) => p.mutedByUser);
+    return myParticipant.any((p) => p.isSelfMutedNow);
   }
 
   /// Fetches the room's members + send policy once; also called by the input
@@ -158,16 +162,53 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
     }
   }
 
+  /// Bell tap: opens the duration sheet (8h / 1 day / 1 week / Forever) when
+  /// unmuted, or unmutes instantly when muted.
   Future<void> _toggleSelfMute() async {
     if (_info == null) return;
+    if (_isMutedByUser) {
+      await _setSelfMuted(null);
+      return;
+    }
+    final duration = await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('Mute notifications for…'),
+            ),
+            for (final entry in const [
+              ('Mute for 8 hours', '8h'),
+              ('Mute for 1 day', '1d'),
+              ('Mute for 1 week', '1w'),
+              ('Mute forever', 'forever'),
+            ])
+              ListTile(
+                title: Text(entry.$1),
+                onTap: () => Navigator.of(sheetContext).pop(entry.$2),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (duration == null) return; // dismissed
+    await _setSelfMuted(duration);
+  }
+
+  /// Applies the self-mute change (duration string, or null to unmute),
+  /// then re-fetches room info so the bell reflects the new state.
+  Future<void> _setSelfMuted(String? duration) async {
     final repo = ref.read(chatsRepositoryProvider);
     try {
-      if (_isMutedByUser) {
+      if (duration == null) {
         await repo.unmuteSelf(widget.chat.id);
       } else {
-        await repo.muteSelf(widget.chat.id);
+        await repo.muteSelf(widget.chat.id, duration: duration);
       }
-      // Re-fetch info to get the updated mutedByUser state.
+      // Re-fetch info to get the updated self-mute state.
       final info = await repo.getInfo(widget.chat.id);
       if (mounted) {
         setState(() {
@@ -225,8 +266,21 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
     final me = ref.watch(currentUserProvider);
     final controller = ref.read(chatRoomProvider(widget.chat.id).notifier);
     // Keep the per-chat dictionary alive + loaded while the room is open
-    // so send-replace and tap-to-reveal have the latest code words.
+    // so send-replace and tap-to-reveal have the latest code words. A
+    // passphrase-locked dictionary exposes no entries until unlocked —
+    // bubbles show raw codes with no reveal, which is exactly right.
     final dict = ref.watch(dictionaryProvider(widget.chat.id));
+
+    // Prompt for the lock passphrase once per room open when the
+    // dictionary is locked (dismissable — the chat stays usable).
+    ref.listen<bool>(
+      dictionaryProvider(widget.chat.id).select((s) => s.isLocked),
+      (prev, next) {
+        if (!next || _unlockPrompted || !mounted) return;
+        _unlockPrompted = true;
+        _showUnlockSheet(context);
+      },
+    );
 
     // Seed the send policy + my role once on open so admins-only rooms lock
     // the input for non-admins right away (the backend also enforces this).
@@ -310,13 +364,23 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
             onPressed: () => _openSearch(context),
           ),
           IconButton(
-            icon: const Icon(Icons.book_outlined),
-            tooltip: 'Code words',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => DictionaryScreen(chat: widget.chat),
-              ),
+            icon: Icon(
+              dict.isLocked ? Icons.lock_outline : Icons.book_outlined,
             ),
+            tooltip: dict.isLocked
+                ? 'Code words (locked — tap to unlock)'
+                : 'Code words',
+            onPressed: () {
+              if (dict.isLocked) {
+                _showUnlockSheet(context);
+                return;
+              }
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => DictionaryScreen(chat: widget.chat),
+                ),
+              );
+            },
           ),
           // Room settings — hidden for DMs, mirroring the web app (a direct
           // chat has no settings to change).
@@ -343,6 +407,40 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
       body: Column(
         children: [
           if (room.lastError != null) StatusBanner(text: room.lastError!),
+          if (dict.isLocked)
+            Material(
+              color: theme.colorScheme.surfaceContainerHighest,
+              child: InkWell(
+                onTap: () => _showUnlockSheet(context),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.lock_outline,
+                        size: 16,
+                        color: theme.colorScheme.outline,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Code words are locked — meanings are hidden '
+                          'until you enter the passphrase.',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: theme.colorScheme.outline,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => _showUnlockSheet(context),
+                        child: const Text('Unlock'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           if (!room.isConnected && !room.isLoading)
             StatusBanner(
               // Include the specific failure (error + redacted URL) when
@@ -393,23 +491,33 @@ class _ChatRoomScreenState extends ConsumerState<ChatRoomScreen> {
             participants: _participants,
             myUserId: me?.clerkId,
             loadParticipants: _loadParticipants,
-            canSend: _isMutedByUser
-                ? false
-                : _canSend(
-                    _canSendMessages,
-                    _info?.canSendMessages,
-                    _info?.isAdmin,
-                  ),
-            lockedHint: _isMutedByUser
-                ? "You've muted this chat"
-                : widget.chat.isDm
-                    ? "The user is no longer your friend you can't text them anymore"
-                    : null,
+            // Self-mute (mutedByUser) only silences push notifications —
+            // it never blocks reading or sending. Only admin mute, the
+            // send policy, and the DM friend-lock restrict sending.
+            canSend: _canSend(
+              _canSendMessages,
+              _info?.canSendMessages,
+              _info?.isAdmin,
+            ),
+            lockedHint: widget.chat.isDm
+                ? "The user is no longer your friend you can't text them anymore"
+                : null,
             lockedCtaLabel: dmCta?.label,
             onLockedCta: dmCta?.onCta,
           ),
         ],
       ),
+    );
+  }
+
+  /// Opens the dictionary unlock sheet. `canReset` exposes the owner's
+  /// "forgot passphrase" escape hatch (admins, and DM partners who have no
+  /// role system).
+  Future<void> _showUnlockSheet(BuildContext context) async {
+    await showDictionaryUnlockSheet(
+      context,
+      chatId: widget.chat.id,
+      canReset: widget.chat.isDm || (_info?.isAdmin ?? false),
     );
   }
 

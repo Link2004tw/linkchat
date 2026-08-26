@@ -25,18 +25,34 @@ import '../firebase_options.dart';
 /// (e.g. Linux desktop) so the app still runs without push.
 Future<void> initializeFirebaseIfAvailable() async {
   // Only initialize on platforms that have Firebase options configured.
-  if (!kIsWeb && !Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS && !Platform.isWindows) {
+  final supported =
+      kIsWeb || Platform.isAndroid || Platform.isIOS || Platform.isMacOS || Platform.isWindows;
+  if (!supported) {
+    debugPrint(
+      'push: skipped — ${Platform.operatingSystem} desktop has no FCM; '
+      'notifications require an Android/iOS device',
+    );
     return;
   }
+  // Idempotent: a hot restart re-runs main(), and initializing an existing
+  // [DEFAULT] app throws [core/duplicate-app], masking real errors.
+  if (firebaseReady) return;
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     );
+    debugPrint('push: Firebase initialized');
   } catch (e) {
-    // Firebase not configured for this platform — push disabled, app continues.
-    debugPrint('Firebase init skipped: $e');
+    // Push will not work, but the app must continue. Loud enough to spot in
+    // the log — this is the line to send when diagnosing [core/no-app].
+    debugPrint('Firebase init FAILED — push disabled. Cause: $e');
   }
 }
+
+/// Whether the [DEFAULT] Firebase app exists (i.e. [initializeFirebaseIfAvailable]
+/// succeeded at some point). Messaging calls fail with `[core/no-app]`
+/// before this is true.
+bool get firebaseReady => Firebase.apps.isNotEmpty;
 
 /// Creates the app's push controller. Call [init] after sign-in,
 /// [dispose] on sign-out.

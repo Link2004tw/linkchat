@@ -363,6 +363,75 @@ void main() {
       expect(chat.displayName, 'Bob');
       expect(chat.otherUser?.clerkId, 'clerk_bob');
     });
+
+    test('mutedByUser defaults to false and parses from JSON', () {
+      final plain = ChatSummary.fromJson({
+        '_id': 'chat1',
+        'access': 'public',
+      });
+      expect(plain.mutedByUser, isFalse);
+
+      final muted = ChatSummary.fromJson({
+        '_id': 'chat1',
+        'access': 'public',
+        'mutedByUser': true,
+      });
+      expect(muted.mutedByUser, isTrue);
+    });
+
+    test('mutedByUser survives a JSON round-trip (offline cache)', () {
+      final muted = ChatSummary.fromJson({
+        '_id': 'chat1',
+        'access': 'public',
+        'mutedByUser': true,
+      });
+      final restored = ChatSummary.fromJson(muted.toJson());
+      expect(restored.mutedByUser, isTrue);
+
+      final unmuted = ChatSummary.fromJson({
+        '_id': 'chat1',
+        'access': 'public',
+      });
+      final restoredUnmuted = ChatSummary.fromJson(unmuted.toJson());
+      expect(restoredUnmuted.mutedByUser, isFalse);
+    });
+
+    test('copyWith(mutedByUser: false) un-mutes; omitted keeps the value', () {
+      final chat = ChatSummary(
+        id: 'chat1',
+        access: 'public',
+        mutedByUser: true,
+      );
+      // Explicit false must reset the flag (false is not null).
+      expect(chat.copyWith(mutedByUser: false).mutedByUser, isFalse);
+      expect(chat.copyWith(mutedByUser: true).mutedByUser, isTrue);
+      expect(chat.copyWith().mutedByUser, isTrue);
+    });
+
+    test('RoomParticipant parses selfMutedUntil and computes isSelfMutedNow',
+        () {
+      final json = {
+        'user': {'userId': 'u1', 'username': 'bob'},
+        'role': 'member',
+        'selfMutedUntil':
+            DateTime.now().add(const Duration(hours: 1)).toIso8601String(),
+      };
+      final active = RoomParticipant.fromJson(json);
+      expect(active.isSelfMutedNow, isTrue);
+
+      final expired = RoomParticipant.fromJson({
+        ...json,
+        'selfMutedUntil': '2020-01-01T00:00:00.000Z',
+      });
+      expect(expired.isSelfMutedNow, isFalse);
+
+      final never = RoomParticipant.fromJson({
+        ...json,
+        'selfMutedUntil': null,
+      });
+      expect(never.isSelfMutedNow, isFalse);
+      expect(never.selfMutedUntil, isNull);
+    });
   });
 
   group('UserSearchResult', () {

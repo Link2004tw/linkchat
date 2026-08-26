@@ -5,7 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/chat.dart';
 import '../providers/auth_providers.dart';
 import '../providers/chat_list_provider.dart';
+import '../providers/repository_providers.dart';
 import '../utils/format.dart';
+import '../utils/snack.dart';
 import '../widgets/status_banner.dart';
 import '../widgets/user_avatar.dart';
 import 'chat_room_screen.dart';
@@ -111,14 +113,14 @@ class ChatListScreen extends ConsumerWidget {
   }
 }
 
-class _ChatTile extends StatelessWidget {
+class _ChatTile extends ConsumerWidget {
   const _ChatTile({required this.chat, required this.onTap});
 
   final ChatSummary chat;
   final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final last = chat.lastMessage;
     final mediaUrl = last?.mediaUrl;
@@ -131,6 +133,7 @@ class _ChatTile extends StatelessWidget {
 
     return ListTile(
       onTap: onTap,
+      onLongPress: () => _showMuteSheet(context, ref),
       leading: _ChatAvatar(chat: chat),
       title: Text(
         chat.displayName,
@@ -155,6 +158,50 @@ class _ChatTile extends StatelessWidget {
       ),
       trailing: _Trailing(chat: chat),
     );
+  }
+
+  /// Long-press menu: mute notifications for a chosen duration (8h / 1 day /
+  /// 1 week / Forever), or unmute when already muted. Mute is
+  /// notifications-only — reading/sending are never affected.
+  Future<void> _showMuteSheet(BuildContext context, WidgetRef ref) async {
+    final action = chat.mutedByUser ? 'unmute' : await showModalBottomSheet<String>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('Mute notifications for…'),
+            ),
+            for (final entry in const [
+              ('Mute for 8 hours', 'mute:8h'),
+              ('Mute for 1 day', 'mute:1d'),
+              ('Mute for 1 week', 'mute:1w'),
+              ('Mute forever', 'mute:forever'),
+            ])
+              ListTile(
+                title: Text(entry.$1),
+                onTap: () => Navigator.of(sheetContext).pop(entry.$2),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (action == null || !context.mounted) return;
+
+    final repo = ref.read(chatsRepositoryProvider);
+    try {
+      if (action == 'unmute') {
+        await repo.unmuteSelf(chat.id);
+        ref.read(chatListProvider.notifier).setSelfMuted(chat.id, false);
+      } else {
+        await repo.muteSelf(chat.id, duration: action.split(':').last);
+        ref.read(chatListProvider.notifier).setSelfMuted(chat.id, true);
+      }
+    } on Exception catch (e) {
+      if (context.mounted) showSnack(context, 'Could not update mute: $e');
+    }
   }
 }
 
@@ -209,11 +256,25 @@ class _Trailing extends StatelessWidget {
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.end,
       children: [
+        // Self-mute indicator: notifications silenced for this chat.
+        // Unread badges keep counting (mute ≠ hide).
         if (last != null)
-          Text(
-            formatTime(last),
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.outline),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (chat.mutedByUser)
+                Icon(
+                  Icons.notifications_off,
+                  size: 14,
+                  color: theme.colorScheme.outline,
+                ),
+              if (chat.mutedByUser) const SizedBox(width: 3),
+              Text(
+                formatTime(last),
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.outline),
+              ),
+            ],
           ),
         const SizedBox(height: 4),
         // A mention badge replaces the plain unread badge when this chat

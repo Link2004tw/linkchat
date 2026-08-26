@@ -14,6 +14,7 @@ import '../utils/format.dart';
 import '../utils/dialogs.dart';
 import '../utils/media_picker.dart';
 import '../utils/snack.dart';
+import '../services/battery_optimization.dart';
 import '../widgets/user_avatar.dart';
 import 'blocked_users_screen.dart';
 
@@ -145,6 +146,8 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
               MaterialPageRoute(builder: (_) => const BlockedUsersScreen()),
             ),
           ),
+          if (Platform.isAndroid)
+            _BatteryTile(onChanged: () => setState(() {})),
           const Divider(),
           OutlinedButton.icon(
             onPressed: _busy ? null : () => _signOut(auth),
@@ -432,6 +435,88 @@ class _ThemePicker extends ConsumerWidget {
           ],
         ),
       ],
+    );
+  }
+}
+
+/// Android-only row showing the battery-optimization exemption state, with
+/// a tap-to-request action. Swiped-away apps without the exemption receive
+/// no FCM notifications on many OEM phones.
+class _BatteryTile extends StatefulWidget {
+  const _BatteryTile({required this.onChanged});
+
+  /// Called after the state may have changed so the parent rebuilds.
+  final VoidCallback onChanged;
+
+  @override
+  State<_BatteryTile> createState() => _BatteryTileState();
+}
+
+class _BatteryTileState extends State<_BatteryTile> {
+  bool? _exempted;
+
+  @override
+  void initState() {
+    super.initState();
+    isIgnoringBatteryOptimizations().then((v) {
+      if (mounted) setState(() => _exempted = v);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final exempted = _exempted;
+    final theme = Theme.of(context);
+    return ListTile(
+      leading: const Icon(Icons.battery_saver),
+      title: const Text('Battery optimization'),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            exempted == null
+                ? 'Checking…'
+                : exempted
+                    ? 'Unrestricted — messages arrive even when closed'
+                    : 'Restricted — swipe-away may block messages',
+          ),
+          if (exempted == false)
+            FutureBuilder<String?>(
+              future: deviceManufacturer(),
+              builder: (_, snap) => snap.hasData
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        manufacturerHint(snap.data),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.error,
+                        ),
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
+        ],
+      ),
+      trailing: exempted == true
+          ? Icon(Icons.check_circle, color: theme.colorScheme.primary)
+          : const Icon(Icons.chevron_right),
+      onTap: exempted == true
+          ? null
+          : () async {
+              await requestIgnoreBatteryOptimizations();
+              // Give the system dialog a moment; then refresh state.
+              await Future<void>.delayed(const Duration(seconds: 2));
+              final now = await isIgnoringBatteryOptimizations();
+              if (!context.mounted) return;
+              showSnack(
+                context,
+                now
+                    ? 'Background activity allowed'
+                    : 'Not allowed — notifications may not arrive when closed',
+              );
+              if (now) widget.onChanged();
+              setState(() => _exempted = now);
+            },
     );
   }
 }

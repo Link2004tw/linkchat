@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/markdown_util.dart';
 import '../../models/content_types.dart';
@@ -13,10 +14,11 @@ import '../../utils/snack.dart';
 import '../user_avatar.dart';
 import 'markdown_message.dart';
 import 'media_bubbles.dart';
+import 'user_profile_sheet.dart';
 
 /// One row: a system message (centered) or a chat bubble. Code words are
 /// shown as-is (opaque) until the bubble is tapped, which reveals meanings.
-class MessageBubble extends StatefulWidget {
+class MessageBubble extends ConsumerStatefulWidget {
   const MessageBubble({
     super.key,
     required this.message,
@@ -66,10 +68,10 @@ class MessageBubble extends StatefulWidget {
   final void Function(String messageId)? onForward;
 
   @override
-  State<MessageBubble> createState() => _MessageBubbleState();
+  ConsumerState<MessageBubble> createState() => _MessageBubbleState();
 }
 
-class _MessageBubbleState extends State<MessageBubble> {
+class _MessageBubbleState extends ConsumerState<MessageBubble> {
   /// True → show meanings instead of code words for this message.
   bool _revealed = false;
 
@@ -108,7 +110,16 @@ class _MessageBubbleState extends State<MessageBubble> {
 
     final avatar = message.author == null
         ? null
-        : UserAvatar(user: message.author!, radius: 16);
+        : UserAvatar(
+            user: message.author!,
+            radius: 16,
+            onTap: () => openUserFromAvatar(
+              context,
+              ref,
+              clerkId: message.author?.clerkId ?? message.author?.backendId,
+              user: message.author,
+            ),
+          );
     final failed = message.sendFailed;
     final revealable = widget.dictEntries.isNotEmpty && !message.isSystem;
 
@@ -331,6 +342,15 @@ class _MessageBubbleState extends State<MessageBubble> {
                       readAt == null
                           ? 'Read'
                           : 'Read ${formatDate(readAt)} · ${formatTime(readAt)}',
+                    ),
+                    onTap: () => openUserFromAvatar(
+                      ctx,
+                      ref,
+                      clerkId: reader.userId,
+                      user: ChatUser(
+                        clerkId: reader.userId,
+                        username: reader.username,
+                      ),
                     ),
                   );
                 },

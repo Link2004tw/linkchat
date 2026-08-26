@@ -19,6 +19,7 @@ import '../providers/repository_providers.dart';
 import '../utils/media_picker.dart';
 import '../utils/snack.dart';
 import '../widgets/user_avatar.dart';
+import '../widgets/chat/user_profile_sheet.dart';
 import 'invite_screen.dart';
 import '../widgets/error_state.dart';
 import '../utils/dialogs.dart';
@@ -674,7 +675,11 @@ class _RoomDetailsScreenState extends ConsumerState<RoomDetailsScreen> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          UserAvatar(user: user, radius: 40),
+          UserAvatar(
+            user: user,
+            radius: 40,
+            onTap: () => openUserFromAvatar(context, ref, clerkId: other?.clerkId, user: user),
+          ),
           const SizedBox(height: 12),
           Text(chat.displayName, style: theme.textTheme.titleLarge),
           const SizedBox(height: 4),
@@ -952,6 +957,7 @@ class _RoomDetailsScreenState extends ConsumerState<RoomDetailsScreen> {
     final busy = _busy.contains(participant.clerkId);
 
     return ListTile(
+      onTap: () => openUserFromAvatar(context, ref, clerkId: participant.clerkId, user: user),
       leading: UserAvatar(
         user: user,
         radius: 20,

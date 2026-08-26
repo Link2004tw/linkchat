@@ -41,6 +41,7 @@ class ThemePrefs {
 
   static const String _modeKey = 'theme_mode';
   static const String _seedKey = 'theme_seed';
+  static const String _batteryPromptKey = 'battery_prompt_dismissed';
 
   final CacheStore _store;
 
@@ -73,6 +74,12 @@ class ThemePrefs {
     if (mode != null) await _store.put(_modeKey, mode.name);
     if (seed != null) await _store.put(_seedKey, seed.name);
   }
+
+  /// True once the user dismissed the battery-optimization prompt ("Not
+  /// now") — we never nag twice.
+  bool get batteryPromptDismissed => _store.get(_batteryPromptKey) == 'true';
+
+  Future<void> dismissBatteryPrompt() => _store.put(_batteryPromptKey, 'true');
 }
 
 final themePrefsProvider = Provider<ThemePrefs>((ref) => ThemePrefs.memory);

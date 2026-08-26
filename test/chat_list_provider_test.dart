@@ -118,6 +118,41 @@ void main() {
       expect(result.map((c) => c.id), ['c1']);
     });
 
+    test('room-update applies mutedByUser true and false', () {
+      final muted = reduceChatList(
+        [_chat('c1', name: 'Room')],
+        ChatListRoomUpdateEvent(chatId: 'c1', updates: {'mutedByUser': true}),
+      );
+      expect(muted.single.mutedByUser, isTrue);
+
+      final unmuted = reduceChatList(
+        [muted.single],
+        ChatListRoomUpdateEvent(chatId: 'c1', updates: {'mutedByUser': false}),
+      );
+      // Explicit false must reset the flag — mute-me broadcasts false.
+      expect(unmuted.single.mutedByUser, isFalse);
+    });
+
+    test('room-update without mutedByUser keeps the current flag', () {
+      final chat = _chat('c1', name: 'Room').copyWith(mutedByUser: true);
+      final result = reduceChatList(
+        [chat],
+        ChatListRoomUpdateEvent(chatId: 'c1', updates: {'name': 'Renamed'}),
+      );
+      expect(result.single.mutedByUser, isTrue);
+    });
+
+    test('room-update ignores non-bool mutedByUser values', () {
+      final result = reduceChatList(
+        [_chat('c1', name: 'Room')],
+        ChatListRoomUpdateEvent(
+          chatId: 'c1',
+          updates: {'mutedByUser': 'yes'},
+        ),
+      );
+      expect(result.single.mutedByUser, isFalse);
+    });
+
     test('kicked and leave-chat remove the chat', () {
       final chats = [_chat('c1'), _chat('c2')];
 

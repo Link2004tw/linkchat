@@ -367,3 +367,37 @@ Decisions (confirmed):
 | 6 | ✅ Tests + analyze | Widget tests: mute action state, self-mute toggle, blocked-list unblock. `dart analyze` clean, full `flutter test` green | High | Medium |
 
 ✅ **Done (2026-08-23):** all six rows implemented — admin mute/unmute with Discord-style durations in `RoomDetailsScreen` (PopupMenuButton with Mute…/Unmute/Kick, 🔇 badge, duration sheet); self-mute input state (`canSend: false` + `lockedHint: "You've muted this chat"` when `mutedByUser`); bell toggle in chat AppBar (`notifications_off`/`notifications_active` icons, `_toggleSelfMute` calling `PUT/DELETE /mute-me`); `BlockedUsersScreen` with unblock buttons routed from ProfileScreen; block entry points on friends-list row menus (PopupMenuButton with Block) and DM header (block/unblock button in `RoomDetailsScreen._dmCard`). 359 Flutter tests green, `flutter analyze` clean. Backend Phases 16–18 fully implemented too (see `backend/tasks.md`).
+
+## Phase 19 — Local-first chats (PLAN-local-first.md)
+Source of truth: `../PLAN-local-first.md`. Gate for this leaf:
+`../gates/L1-flutter-local-db.md`. Backend contract already shipped (leaf C1,
+see `backend/tasks.md` Phase 19).
+
+### L1 — Local DB foundation
+Decisions (confirmed):
+- **Drift/SQLite** via `drift` + `drift_flutter`; schema mirrors the existing
+  models 1:1 by storing each model's full JSON payload (`toJson`) in a TEXT
+  column alongside typed index columns — lossless round-trips (no adapters,
+  no drift on models) and future-proof against new fields; queries/sorts use
+  the indexed columns only.
+- Two tables now: `chat_list_rows` (id PK, updatedAtMs + lastMessageAtMs
+  indexed, mutedByUser, isDm, payload) and `message_rows` (id PK, chatId,
+  createdAtMs indexed `(chatId, createdAtMs)`, pendingId?, sendFailed, payload).
+- DAOs (`ChatListDao`, `MessageDao`) expose keyset pagination that mirrors
+  the server's `before` semantics (newest page → older pages via a message-id
+  cursor), so the repository can serve identical pages offline.
+- Read-through policy for L1: **network-first, local-fallback, write-through**
+  — `MessagesRepository.getMessages` persists every successful REST page into
+  Drift and serves cached pages when the network fails (offline scroll-up
+  history beyond Hive's single room page). Making the DB primary is L3/L6.
+- Chat list stays on the synchronous Hive first-paint path this phase;
+  `ChatListDao` ships with tests and gets wired at cutover (L3/L6).
+- Pending/optimistic rows are never persisted (mirrors today's ChatCache
+  rule); `pendingId != null || sendFailed` rows are filtered out on write.
+
+| # | Title | Description | Priority | Difficulty |
+|---|-------|-------------|----------|------------|
+| 1 | ✅ Drift deps + database class | `pubspec.yaml`: `drift`, `drift_flutter`, dev `drift_dev` + `build_runner`; `lib/db/local_db.dart`: both tables, schema v1, `LocalDb` opening `driftDatabase(name: 'chat_local')` (injectable executor for memory-backed tests), codegen via build_runner | High | Medium |
+| 2 | ✅ DAOs | `ChatListDao`: upsertChats (server wins per id), all sorted by recency (lastMessageAt ?? updatedAt desc), deleteChat. `MessageDao`: upsertMessages (dedupe by id), newestPage(limit), olderPage(chatId, beforeId, limit) mirroring MessagePage keyset semantics, countForChat | High | Medium |
+| 3 | ✅ Repository read-through | `MessagesRepository` gains optional `MessageDao? local`: successful REST pages write through to Drift (pending/failed rows skipped); on network failure, serve from Drift (newest or cursor page) instead of throwing. Signature unchanged; provider wires the app-wide `localDbProvider` (overridable in tests) | High | Medium |
+| 4 | ✅ Tests & verification | `test/local_db_test.dart`: chat-list upsert/sort/delete round-trip; message upsert dedupe + payload round-trip (fromWs/toJson); keyset pagination incl. same-ms tie-break determinism; repository read-through with a failing MockClient serving persisted rows, and a successful fetch persisting them. `flutter analyze` clean, full `flutter test` green | High | Medium |

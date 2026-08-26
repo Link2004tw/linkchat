@@ -106,6 +106,7 @@ class ChatSummary {
     this.previewMembers = const [],
     this.otherUser,
     this.pictureUrl,
+    this.mutedByUser = false,
   });
 
   final String id;
@@ -136,6 +137,10 @@ class ChatSummary {
   /// partner's profile picture instead.
   final String? pictureUrl;
 
+  /// True when I muted notifications for this chat (self-mute). Purely a
+  /// notification flag — it never blocks reading or sending.
+  final bool mutedByUser;
+
   /// Returns a copy with the given fields replaced (used for live list
   /// updates from the chat-list WebSocket).
   ChatSummary copyWith({
@@ -146,6 +151,7 @@ class ChatSummary {
     DateTime? updatedAt,
     ChatLastMessage? lastMessage,
     String? pictureUrl,
+    bool? mutedByUser,
   }) => ChatSummary(
     id: id,
     name: name ?? this.name,
@@ -158,6 +164,9 @@ class ChatSummary {
     previewMembers: previewMembers,
     otherUser: otherUser,
     pictureUrl: pictureUrl ?? this.pictureUrl,
+    // Non-nullable bool: passing false explicitly un-mutes (false is not
+    // null, so the ?? fallback never swallows an unmute).
+    mutedByUser: mutedByUser ?? this.mutedByUser,
   );
 
   bool get isDm => access == 'direct';
@@ -190,6 +199,7 @@ class ChatSummary {
         ? ChatOtherUser.fromJson(json['otherUser'] as Map<String, dynamic>)
         : null,
     pictureUrl: asString(json['pictureUrl']),
+    mutedByUser: json['mutedByUser'] == true,
   );
 
   /// Serializes for local caching.
@@ -205,6 +215,7 @@ class ChatSummary {
     'previewMembers': previewMembers,
     'otherUser': otherUser?.toJson(),
     'pictureUrl': pictureUrl,
+    'mutedByUser': mutedByUser,
   };
 }
 
@@ -284,7 +295,7 @@ class RoomParticipant {
     this.profileImageUrl,
     required this.role,
     this.mutedUntil,
-    this.mutedByUser = false,
+    this.selfMutedUntil,
   });
 
   final String clerkId;
@@ -295,13 +306,21 @@ class RoomParticipant {
   final String role;
 
   final String? mutedUntil;
-  final bool mutedByUser;
+
+  /// Self-mute (notifications-only) expiry. Null = never muted.
+  final String? selfMutedUntil;
 
   bool get isAdmin => role == 'owner' || role == 'admin';
 
   bool get isMutedNow =>
       mutedUntil != null &&
       DateTime.tryParse(mutedUntil!)?.isAfter(DateTime.now()) == true;
+
+  /// Self-mute active right now (time-based, so a long-open room reflects
+  /// expiry without refetching).
+  bool get isSelfMutedNow =>
+      selfMutedUntil != null &&
+      DateTime.tryParse(selfMutedUntil!)?.isAfter(DateTime.now()) == true;
 
   factory RoomParticipant.fromJson(Map<String, dynamic> json) {
     final user = json['user'] is Map<String, dynamic>
@@ -313,7 +332,7 @@ class RoomParticipant {
       profileImageUrl: asString(user['profileImageUrl']),
       role: asString(json['role']) ?? 'member',
       mutedUntil: asString(json['mutedUntil']),
-      mutedByUser: json['mutedByUser'] == true,
+      selfMutedUntil: asString(json['selfMutedUntil']),
     );
   }
 }

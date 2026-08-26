@@ -10,6 +10,7 @@ import '../providers/auth_providers.dart';
 import '../providers/chat_list_provider.dart';
 import '../providers/push_provider.dart';
 import '../utils/snack.dart';
+import '../widgets/battery_prompt.dart';
 import '../widgets/friend_notification_listener.dart';
 import 'email_auth_screen.dart';
 import 'home_shell.dart';
@@ -66,6 +67,11 @@ class AuthGate extends ConsumerWidget {
           });
           // Register the FCM token on sign-in
           ref.read(pushNotificationsProvider).init();
+          // OEM phones: ask once for the battery-optimization exemption so
+          // swiped-away apps keep receiving FCM.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (context.mounted) maybeShowBatteryPrompt(context, ref);
+          });
           return const FriendNotificationListener(child: HomeShell());
         },
         signedOutBuilder: (context, authState) {

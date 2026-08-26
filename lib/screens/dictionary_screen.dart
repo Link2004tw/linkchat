@@ -6,10 +6,13 @@ import '../models/dictionary.dart';
 import '../providers/dictionary_provider.dart';
 import '../utils/snack.dart';
 import '../utils/dialogs.dart';
+import '../widgets/chat/dictionary_unlock_sheet.dart';
 
 /// Per-chat code-word dictionary: list / add / edit / delete entries and
-/// save them (re-encrypted client-side under the shared chat key). Also
-/// shows which members are still missing (or stale) their key wrap.
+/// save them (re-encrypted client-side under the shared chat key or, for
+/// passphrase-locked chats, under the key derived from the lock
+/// passphrase). Also shows which members are still missing (or stale)
+/// their key wrap.
 class DictionaryScreen extends ConsumerStatefulWidget {
   const DictionaryScreen({super.key, required this.chat});
 
@@ -23,10 +26,20 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
   late List<DictEntry> _entries;
   bool _saving = false;
 
+  /// Lock passphrase typed when CREATING a new dictionary (mandatory) —
+  /// every dictionary is passphrase-locked from birth.
+  final TextEditingController _passController = TextEditingController();
+
   @override
   void initState() {
     super.initState();
     _entries = [...ref.read(dictionaryProvider(widget.chat.id)).entries];
+  }
+
+  @override
+  void dispose() {
+    _passController.dispose();
+    super.dispose();
   }
 
   Future<void> _save() async {
@@ -34,6 +47,7 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
     final result =
         await ref.read(dictionaryProvider(widget.chat.id).notifier).save(
               [for (final e in _entries) if (e.isValid) e],
+              lockPassphrase: _passController.text.trim(),
             );
     setState(() {
       _saving = false;
@@ -44,7 +58,68 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
     if (!mounted) return;
     showSnack(
       context,
-      result.ok ? 'Dictionary saved' : result.error ?? 'Error',
+      result.ok
+          ? 'Dictionary saved'
+          : result.error ?? 'Error',
+    );
+  }
+
+  /// Prompts for a passphrase with an obscured field. Returns null on cancel.
+  Future<String?> _promptPassphrase(
+    BuildContext context, {
+    required String title,
+    required String label,
+  }) async {
+    final controller = TextEditingController();
+    try {
+      return await showDialog<String>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(title),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            obscureText: true,
+            decoration: InputDecoration(labelText: label),
+            onSubmitted: (v) => Navigator.of(dialogContext).pop(v),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(controller.text.trim()),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    } finally {
+      controller.dispose();
+    }
+  }
+
+  /// Opts the (legacy, wrap-based) dictionary into the passphrase lock:
+  /// re-encrypts under a derived key and drops the wraps.
+  Future<void> _addLock() async {
+    final passphrase = await _promptPassphrase(
+      context,
+      title: 'Add lock passphrase',
+      label: 'Passphrase',
+    );
+    if (passphrase == null || passphrase.isEmpty) return;
+    setState(() => _saving = true);
+    final result =
+        await ref.read(dictionaryProvider(widget.chat.id).notifier).addLock(
+              passphrase,
+            );
+    if (!mounted) return;
+    setState(() => _saving = false);
+    showSnack(
+      context,
+      result.ok ? 'Dictionary locked' : result.error ?? 'Error',
     );
   }
 
@@ -123,6 +198,47 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
     final theme = Theme.of(context);
     final dict = ref.watch(dictionaryProvider(widget.chat.id));
 
+    // Locked and not unlocked in this session: no editor at all. The room
+    // usually gates navigation here, but this guard covers deep links.
+    if (dict.isLocked) {
+      return Scaffold(
+        appBar: AppBar(title: Text('Code words · ${widget.chat.displayName}')),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.lock_outline,
+                  size: 40,
+                  color: theme.colorScheme.outline,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'The code words are locked.\nEnter the shared passphrase '
+                  'to view or edit them.',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: () => showDictionaryUnlockSheet(
+                    context,
+                    chatId: widget.chat.id,
+                  ),
+                  icon: const Icon(Icons.lock_open_outlined),
+                  label: const Text('Unlock'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    final creating = !dict.hasDictionary && !dict.isLoading;
+
     return Scaffold(
       appBar: AppBar(
         title: Text('Code words · ${widget.chat.displayName}'),
@@ -138,12 +254,32 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
                 ),
               ),
             )
-          else
+          else ...[
             IconButton(
               icon: const Icon(Icons.save_outlined),
               tooltip: 'Save dictionary',
               onPressed: _save,
             ),
+            // Legacy (wrap-based) dictionaries can opt into the passphrase
+            // lock; locked ones are already locked by definition.
+            if (dict.hasDictionary && !dict.needsRekey)
+              PopupMenuButton<String>(
+                tooltip: 'More',
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'add-lock',
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Icon(Icons.lock_outline),
+                      title: Text('Add lock passphrase'),
+                    ),
+                  ),
+                ],
+                onSelected: (value) {
+                  if (value == 'add-lock') _addLock();
+                },
+              ),
+          ],
         ],
       ),
       body: Column(
@@ -201,45 +337,80 @@ class _DictionaryScreenState extends ConsumerState<DictionaryScreen> {
             const Expanded(
               child: Center(child: CircularProgressIndicator()),
             )
-          else if (_entries.isEmpty)
-            const Expanded(
-              child: Center(child: Text('No code words yet — add one below.')),
-            )
-          else
-            Expanded(
-              child: ListView.builder(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: _entries.length,
-                itemBuilder: (context, index) {
-                  final entry = _entries[index];
-                  return ListTile(
-                    leading: const Icon(Icons.tag),
-                    title: Text(entry.code),
-                    subtitle: Text(entry.meaning),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.edit_outlined),
-                          tooltip: 'Edit',
-                          onPressed: () => _editEntry(index: index),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.delete_outline),
-                          tooltip: 'Delete',
-                          onPressed: () => setState(() {
-                            _entries = [
-                              for (var i = 0; i < _entries.length; i++)
-                                if (i != index) _entries[i],
-                            ];
-                          }),
-                        ),
-                      ],
+          else ...[
+            if (creating) ...[
+              Container(
+                width: double.infinity,
+                color: theme.colorScheme.surfaceContainerHighest,
+                padding: const EdgeInsets.all(12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Set a lock passphrase — every dictionary is locked. '
+                      'Meanings stay hidden in the chat until a member '
+                      'enters it (again after each app start). Share it '
+                      'with members directly; new joiners need it too.',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
-                  );
-                },
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _passController,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Lock passphrase',
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
+              const SizedBox(height: 8),
+            ],
+            if (_entries.isEmpty)
+              const Expanded(
+                child:
+                    Center(child: Text('No code words yet — add one below.')),
+              )
+            else
+              Expanded(
+                child: ListView.builder(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: _entries.length,
+                  itemBuilder: (context, index) {
+                    final entry = _entries[index];
+                    return ListTile(
+                      leading: const Icon(Icons.tag),
+                      title: Text(entry.code),
+                      subtitle: Text(entry.meaning),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.edit_outlined),
+                            tooltip: 'Edit',
+                            onPressed: () => _editEntry(index: index),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            tooltip: 'Delete',
+                            onPressed: () => setState(() {
+                              _entries = [
+                                for (var i = 0; i < _entries.length; i++)
+                                  if (i != index) _entries[i],
+                              ];
+                            }),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+          ],
           const Divider(height: 1),
           _MemberWrapStatus(participants: dict.participants, wraps: dict.wraps),
           Padding(

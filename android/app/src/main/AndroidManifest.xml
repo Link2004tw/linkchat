@@ -6,6 +6,10 @@
     <!-- Push notifications (Android 13+ runtime permission; firebase_messaging
          also merges this, declared explicitly for robustness). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- OEM battery managers block FCM delivery for swiped-away apps unless
+         the user exempts the app (doze whitelist). We show a system dialog
+         asking for this once after sign-in. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <!-- usesCleartextTraffic is set in src/debug/AndroidManifest.xml ONLY:
          debug builds may talk to a plain-HTTP dev backend (http://10.0.2.2:3001).
          Release builds default to HTTPS and must not allow cleartext. -->

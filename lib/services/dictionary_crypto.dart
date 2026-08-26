@@ -250,8 +250,8 @@ class DictionaryCrypto {
     if (!meta.isValid) {
       throw ArgumentError('Invalid dictionary lock metadata');
     }
-    final derived = await _pbkdf2.deriveKey(
-      passphrase: utf8.encode(passphrase),
+    final derived = await _pbkdf2.deriveKeyFromPassword(
+      password: passphrase,
       nonce: base64Decode(meta.salt),
     );
     return Uint8List.fromList(await derived.extractBytes());

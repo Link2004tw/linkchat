@@ -19,6 +19,16 @@ class UserRepository {
     return asJsonList(data).map(UserSearchResult.fromJson).toList();
   }
 
+  /// `GET /user/:clerkId` — one user's public profile with the caller's
+  /// relationship to them (friend status, DM id, shared rooms). Throws a
+  /// 404 [ApiException] when the target has blocked the caller.
+  Future<UserSearchResult> getUser(String clerkId) async {
+    final data = await _api.get('/user/${Uri.encodeComponent(clerkId)}');
+    return UserSearchResult.fromJson(
+      data is Map<String, dynamic> ? data : const {},
+    );
+  }
+
   /// `PATCH /user/profile` — update the caller's own profile (username,
   /// display name, avatar URL). Username conflicts surface as
   /// [ApiException] with 409. Pass `profileImageUrl` as an empty string to

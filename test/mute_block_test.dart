@@ -322,21 +322,49 @@ void main() {
       await tester.pump();
 
       // Verify the model logic that drives the bell icon.
-      const muted = RoomParticipant(
+      const unmuted = RoomParticipant(
         clerkId: 'clerk_alice',
         username: 'alice',
         role: 'owner',
-        mutedByUser: false,
       );
-      const selfMuted = RoomParticipant(
+      final selfMuted = RoomParticipant(
         clerkId: 'clerk_alice',
         username: 'alice',
         role: 'owner',
-        mutedByUser: true,
+        selfMutedUntil:
+            DateTime.now().add(const Duration(hours: 8)).toIso8601String(),
       );
 
-      expect(muted.mutedByUser, isFalse);
-      expect(selfMuted.mutedByUser, isTrue);
+      expect(unmuted.isSelfMutedNow, isFalse);
+      expect(unmuted.selfMutedUntil, isNull);
+      expect(selfMuted.isSelfMutedNow, isTrue);
+    });
+
+    testWidgets('RoomParticipant.isSelfMutedNow respects expiry',
+        (tester) async {
+      const never = RoomParticipant(
+        clerkId: 'u1',
+        username: 'user',
+        role: 'member',
+        selfMutedUntil: null,
+      );
+      const expired = RoomParticipant(
+        clerkId: 'u1',
+        username: 'user',
+        role: 'member',
+        selfMutedUntil: '2020-01-01T00:00:00.000Z',
+      );
+      final active = RoomParticipant(
+        clerkId: 'u1',
+        username: 'user',
+        role: 'member',
+        selfMutedUntil:
+            DateTime.now().add(const Duration(hours: 1)).toIso8601String(),
+      );
+
+      expect(never.isSelfMutedNow, isFalse);
+      expect(expired.isSelfMutedNow, isFalse);
+      expect(active.isSelfMutedNow, isTrue);
     });
 
     testWidgets('RoomParticipant.isMutedNow respects mutedUntil',

@@ -80,6 +80,16 @@ class _FakeDictionaryServer {
   bool failFirstPut = true;
   bool alwaysConflict = false;
 
+  /// When non-null, the dictionary is passphrase-locked ("locked-v1"):
+  /// GET serves a kdf-sealed blob with no wraps; PUT expects the same
+  /// format and re-stores whatever was sent.
+  String? lockPassphrase;
+  DictionaryLockMeta? lockMeta;
+  List<DictEntry> lockedEntries = const [
+    DictEntry(code: 'a', meaning: 'Alpha'),
+    DictEntry(code: 'm', meaning: 'Mark'),
+  ];
+
   /// Optional interceptor (tests can short-circuit any request).
   http.Response? Function(http.Request req)? beforeRequest;
 
@@ -113,6 +123,33 @@ class _FakeDictionaryServer {
       final body = jsonDecode(req.body) as Map<String, dynamic>;
       final dict = body['dictionary'] as Map<String, dynamic>;
       final payloadVersion = (dict['version'] as num).toInt();
+
+      if (dict['format'] == 'locked-v1') {
+        if (payloadVersion <= version) {
+          return _json(
+            {'error': 'dictionary.version must be newer than the stored one'},
+            409,
+          );
+        }
+        version = payloadVersion;
+        lockMeta = DictionaryLockMeta.fromJson(
+          dict['kdf'] as Map<String, dynamic>,
+        );
+        if (lockPassphrase != null) {
+          try {
+            lockedEntries = await crypto.decryptEntriesLocked(
+              ciphertext: dict['ciphertext'] as String,
+              iv: dict['iv'] as String,
+              authTag: dict['authTag'] as String,
+              passphrase: lockPassphrase!,
+              meta: lockMeta!,
+            );
+          } on Exception {
+            // Client used a different passphrase — opaque to the server.
+          }
+        }
+        return _json({'version': payloadVersion});
+      }
 
       if (alwaysConflict) {
         version = payloadVersion;
@@ -160,6 +197,46 @@ class _FakeDictionaryServer {
   }
 
   Future<Map<String, dynamic>> _contextJson() async {
+    final participants = [
+      {
+        'userId': myUserId,
+        'clerkId': myClerkId,
+        'username': 'me',
+        'deviceId': myDeviceId,
+        'encPublicKey': myPub,
+        'encPublicKeyVersion': participantKeyVersion,
+      },
+      if (includeOtherDevice)
+        {
+          'userId': myUserId,
+          'clerkId': myClerkId,
+          'username': 'me',
+          'deviceId': otherDeviceId,
+          'encPublicKey': myPub,
+          'encPublicKeyVersion': otherParticipantKeyVersion,
+        },
+    ];
+
+    if (lockPassphrase != null) {
+      lockMeta ??= await crypto.createLockMeta();
+      final blob = await crypto.encryptEntriesLocked(
+        entries: lockedEntries,
+        passphrase: lockPassphrase!,
+        meta: lockMeta!,
+      );
+      return {
+        'dictionary': {
+          'ciphertext': blob.ciphertext,
+          'iv': blob.iv,
+          'authTag': blob.authTag,
+          'version': version,
+          'format': 'locked-v1',
+          'kdf': lockMeta!.toJson(),
+        },
+        'participants': participants,
+      };
+    }
+
     final blob = await crypto.encryptEntries(
       entries: entries,
       chatKey: corruptWithKey ?? chatKey,
@@ -193,25 +270,7 @@ class _FakeDictionaryServer {
           if (otherWrap != null) otherWrap.toJson(),
         ],
       },
-      'participants': [
-        {
-          'userId': myUserId,
-          'clerkId': myClerkId,
-          'username': 'me',
-          'deviceId': myDeviceId,
-          'encPublicKey': myPub,
-          'encPublicKeyVersion': participantKeyVersion,
-        },
-        if (includeOtherDevice)
-          {
-            'userId': myUserId,
-            'clerkId': myClerkId,
-            'username': 'me',
-            'deviceId': otherDeviceId,
-            'encPublicKey': myPub,
-            'encPublicKeyVersion': otherParticipantKeyVersion,
-          },
-      ],
+      'participants': participants,
     };
   }
 }
@@ -700,6 +759,132 @@ void main() {
       expect(find.text('Alpha'), findsOneWidget);
       expect(find.text('Bravo'), findsOneWidget);
       expect(find.text('Mark'), findsOneWidget);
+    });
+  });
+
+  group('passphrase-locked dictionary (locked-v1)', () {
+    test(
+        'loads locked, refuses saves, unlocks with the right passphrase only',
+        () async {
+      final key = await _keyMaterial();
+      final (chatKey, myPub, pair) = key;
+      final crypto = DictionaryCrypto();
+      final fake = _FakeDictionaryServer(
+        crypto: crypto,
+        chatKey: chatKey,
+        myPub: myPub,
+        myUserId: 'user_me',
+        myClerkId: 'user_me',
+      )..lockPassphrase = 'open sesame';
+      final (container, _) = await _make(key, fake);
+
+      final controller = container.read(dictionaryProvider('c1').notifier);
+      await controller.reload();
+
+      var state = controller.state;
+      expect(state.isLocked, isTrue);
+      expect(state.hasDictionary, isTrue);
+      expect(state.entries, isEmpty);
+      expect(state.version, 2);
+      // Nothing plaintext leaked into the cache while locked.
+      expect(
+        container.read(chatCacheProvider).readDictionary('c1'),
+        isNull,
+      );
+
+      // Saves are gated behind the unlock.
+      final refused = await controller.save([const DictEntry(code: 'x', meaning: 'X')]);
+      expect(refused.ok, isFalse);
+      expect(refused.error, contains('Unlock'));
+
+      // Wrong passphrase keeps the chat locked…
+      final bad = await controller.unlock('wrong');
+      expect(bad.ok, isFalse);
+      state = controller.state;
+      expect(state.isLocked, isTrue);
+
+      // …the right one reveals the entries.
+      final good = await controller.unlock('open sesame');
+      expect(good.ok, isTrue);
+      state = controller.state;
+      expect(state.isLocked, isFalse);
+      expect(state.entries.map((e) => e.meaning), ['Alpha', 'Mark']);
+    });
+
+    test('save after unlock re-encrypts under the lock without wraps',
+        () async {
+      final key = await _keyMaterial();
+      final (chatKey, myPub, pair) = key;
+      final crypto = DictionaryCrypto();
+      final fake = _FakeDictionaryServer(
+        crypto: crypto,
+        chatKey: chatKey,
+        myPub: myPub,
+        myUserId: 'user_me',
+        myClerkId: 'user_me',
+      )..lockPassphrase = 'pw';
+      final (container, _) = await _make(key, fake);
+
+      final controller = container.read(dictionaryProvider('c1').notifier);
+      await controller.reload();
+      expect(await controller.unlock('pw'), (ok: true, error: null));
+
+      final result = await controller.save([
+        const DictEntry(code: 'a', meaning: 'Alpha'),
+        const DictEntry(code: 'm', meaning: 'Mark'),
+        const DictEntry(code: 'z', meaning: 'Zulu'),
+      ]);
+      expect(result.ok, isTrue);
+      expect(fake.putCalls, 1);
+      expect(fake.version, 3);
+      expect(fake.lockedEntries.map((e) => e.code), ['a', 'm', 'z']);
+
+      // The server blob stays locked-v1 for the NEXT session.
+      final contextJson = await fake.handle(
+        http.Request(
+          'GET',
+          Uri.parse('http://localhost/api/chats/c1/dictionary'),
+        ),
+      );
+      final body = jsonDecode(contextJson.body) as Map<String, dynamic>;
+      expect(body['dictionary']['format'], 'locked-v1');
+      expect(body['dictionary'].containsKey('wraps'), isFalse);
+    });
+
+    test('resetLockKey starts over under a new passphrase; old one dies',
+        () async {
+      final key = await _keyMaterial();
+      final (chatKey, myPub, pair) = key;
+      final crypto = DictionaryCrypto();
+      final fake = _FakeDictionaryServer(
+        crypto: crypto,
+        chatKey: chatKey,
+        myPub: myPub,
+        myUserId: 'user_me',
+        myClerkId: 'user_me',
+      )..lockPassphrase = 'old-pw';
+      final (container, _) = await _make(key, fake);
+
+      final controller = container.read(dictionaryProvider('c1').notifier);
+      await controller.reload();
+      expect(controller.state.isLocked, isTrue);
+
+      final result = await controller.resetLockKey('brand new');
+      expect(result.ok, isTrue);
+      final state = controller.state;
+      expect(state.isLocked, isFalse);
+      expect(state.entries, isEmpty); // start-over: no code words survive
+      expect(fake.version, 3);
+
+      // A fresh session (lock() drops the in-memory key, as an app
+      // restart would): the blob is now sealed under the NEW passphrase,
+      // so the old one no longer authenticates.
+      fake.lockPassphrase = 'brand new';
+      await controller.lock();
+      final locked = controller.state;
+      expect(locked.isLocked, isTrue);
+      expect((await controller.unlock('old-pw')).ok, isFalse);
+      expect((await controller.unlock('brand new')).ok, isTrue);
     });
   });
 }

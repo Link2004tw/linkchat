@@ -445,7 +445,6 @@ class DictionaryController
   /// current entries under a passphrase-derived key and drops the wraps.
   /// Requires a decrypted session ([state.entries] populated).
   Future<({bool ok, String? error})> addLock(String passphrase) async {
-    final crypto = ref.read(dictionaryCryptoProvider);
     if (!state.hasDictionary || state.isLocked) {
       return (ok: false, error: 'No unlockable dictionary to lock');
     }
@@ -456,11 +455,9 @@ class DictionaryController
       return (ok: false, error: 'Enter a passphrase');
     }
     try {
-      final meta = await crypto.createLockMeta();
       final saved = await _saveLocked(
-        entries: [for (final e in state.entries) if (e.isValid) e],
+        [for (final e in state.entries) if (e.isValid) e],
         passphrase: passphrase,
-        meta: meta,
       );
       debugPrint('dictionary[$chatId]: lock added at v${saved.version}');
       return (ok: true, error: null);
@@ -709,14 +706,14 @@ class DictionaryController
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
         final blob =
-            await crypto.encryptEntries(entries: merged, chatKey: key!);
+            await crypto.encryptEntries(entries: merged, chatKey: key);
         final version = await repo.saveDictionary(
           chatId: chatId,
           version: state.version + 1,
           ciphertext: blob.ciphertext,
           iv: blob.iv,
           authTag: blob.authTag,
-          lock: meta!,
+          lock: meta,
         );
         _lockKey = key;
         _activeLockMeta = meta;
